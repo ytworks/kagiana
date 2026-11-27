@@ -97,21 +97,38 @@ def _worker_loop(
             conn.close()
         return
 
-    conn.send(("ready", None))
+    try:
+        conn.send(("ready", None))
+    except (OSError, BrokenPipeError, ValueError):
+        # The parent is gone; there is nobody to report to.
+        return
+
     while True:
         try:
             message = conn.recv()
-        except (EOFError, KeyboardInterrupt):
+        except (EOFError, KeyboardInterrupt, OSError):
             return
         if message is None:
             return
         index, payload = message
         _CURRENT["conn"] = conn
         _CURRENT["index"] = index
+        started = monotonic()
         try:
-            conn.send(("ok", (index, task(payload))))
-        except BaseException as exc:  # noqa: BLE001 - one bad molecule must not stop the run
-            conn.send(("error", (index, f"{type(exc).__name__}: {exc}")))
+            try:
+                value = task(payload)
+            except BaseException as exc:  # noqa: BLE001 - one bad molecule must not stop the run
+                message_out = (
+                    "error",
+                    (index, f"{type(exc).__name__}: {exc}", monotonic() - started),
+                )
+            else:
+                message_out = ("ok", (index, value, monotonic() - started))
+            try:
+                conn.send(message_out)
+            except (OSError, BrokenPipeError, ValueError):
+                # The parent died while this task was running.
+                return
         finally:
             _CURRENT["conn"] = None
             _CURRENT["index"] = -1
@@ -361,10 +378,9 @@ class KillableWorkerPool:
                 slot.progress = value
             return None
 
-        index, body = payload
-        now = monotonic()
-        elapsed = now - slot.dispatched_at
-        overran = self._timeout is not None and now > slot.deadline
+        index, body, duration = payload
+        elapsed = float(duration)
+        overran = self._timeout is not None and elapsed > self._timeout
         progress = slot.progress
         slot.state = _IDLE
         slot.index = -1
@@ -391,6 +407,17 @@ class KillableWorkerPool:
         for position, slot in enumerate(self._slots):
             if slot.state != _BUSY or now < slot.deadline:
                 continue
+
+            # The deadline has passed in wall-clock terms, but the worker may
+            # already have sent its result and simply not been read yet.
+            delivered = self._drain(position, slot)
+            if delivered is not None:
+                buffered[delivered.index] = delivered
+                continue
+            if slot.state != _BUSY:
+                # Draining replaced a dead worker; there is nothing to kill.
+                continue
+
             buffered[slot.index] = TaskResult(
                 slot.index,
                 None,
@@ -401,6 +428,18 @@ class KillableWorkerPool:
             )
             self._kills += 1
             self._slots[position] = self._replace(slot)
+
+
+    def _drain(self, position: int, slot: _Slot) -> TaskResult | None:
+        """Read everything a worker has already sent, returning its result."""
+        while slot.conn.poll(0):
+            result = self._receive(position, slot)
+            if result is not None:
+                return result
+            if self._slots[position] is not slot:
+                # The slot was replaced, so its connection is gone.
+                return None
+        return None
 
 
 def _prepend(item: tuple[int, Any], rest: Iterator[tuple[int, Any]]) -> Iterator[tuple[int, Any]]:

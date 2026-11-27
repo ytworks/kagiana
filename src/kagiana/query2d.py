@@ -168,8 +168,21 @@ def read_reference_smiles(query_path: str | Path) -> str:
 
 
 def reference_fingerprint(smiles: str, sig_factory: SigFactory) -> Any:
-    """Fingerprint of the reference molecule; raises if it cannot be parsed."""
-    reference = fingerprint(smiles, sig_factory)
+    """Fingerprint of the reference molecule, as an input error when it fails.
+
+    Generating a signature can fail on a molecule RDKit parses without
+    complaint, so this is reported the same way an unreadable file is: the
+    reference molecule is input, and the run cannot start without it.
+    """
+    try:
+        reference = fingerprint(smiles, sig_factory)
+    except InputError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise InputError(
+            f"no fingerprint could be generated for the reference molecule "
+            f"{smiles!r}: {type(exc).__name__}: {exc}"
+        ) from exc
     if reference is None:
         raise InputError(f"reference SMILES could not be parsed: {smiles!r}")
     return reference

@@ -18,6 +18,13 @@ import numpy as np
 #: candidate features per query point cannot dominate the run.
 DEFAULT_COMBINATION_BUDGET = 2000
 
+#: Ceiling on partial assignments examined per conformer.  Completed
+#: assignments are not the only cost: a query whose points cannot all be
+#: satisfied at once produces none of them while still walking an enormous
+#: tree, and that walk happens in the parent process where the per-molecule
+#: deadline does not reach it.
+DEFAULT_NODE_BUDGET = 50_000
+
 
 def kabsch_rmsd(mobile: np.ndarray, target: np.ndarray) -> float:
     """RMSD between two point sets after optimal rigid-body superposition.
@@ -44,8 +51,37 @@ def kabsch_rmsd(mobile: np.ndarray, target: np.ndarray) -> float:
     return float(np.sqrt((deviation**2).sum() / len(mobile)))
 
 
+#: Counters from the most recent search, read by the caller to tell a complete
+#: search from one that ran out of budget.
+_LAST_SEARCH: dict[str, int] = {"produced": 0, "visited": 0}
+
+
+def _position_key(position: np.ndarray) -> tuple[float, float, float]:
+    return (float(position[0]), float(position[1]), float(position[2]))
+
+
+def _too_few_positions(candidates: Sequence[Sequence[np.ndarray]]) -> bool:
+    """Whether no assignment can exist because positions would have to repeat.
+
+    Each query point needs a position of its own, so a query with more points
+    than there are distinct positions on offer has no valid assignment at all.
+    Settling that by counting avoids searching a tree that cannot contain an
+    answer, which is where an unsatisfiable query would otherwise spend its
+    time.
+    """
+    distinct: set[tuple[float, float, float]] = set()
+    for group in candidates:
+        for position in group:
+            distinct.add(_position_key(position))
+            if len(distinct) >= len(candidates):
+                return False
+    return len(distinct) < len(candidates)
+
+
 def _distinct_assignments(
-    candidates: Sequence[Sequence[np.ndarray]], budget: int
+    candidates: Sequence[Sequence[np.ndarray]],
+    budget: int,
+    node_budget: int,
 ) -> Iterator[list[np.ndarray]]:
     """Enumerate assignments that give each query point a distinct position.
 
@@ -63,36 +99,44 @@ def _distinct_assignments(
     """
     n_points = len(candidates)
     produced = 0
+    visited = 0
     chosen: list[np.ndarray] = []
-    used: list[tuple[float, float, float]] = []
+    used: set[tuple[float, float, float]] = set()
 
     def walk(point: int) -> Iterator[list[np.ndarray]]:
-        nonlocal produced
-        if produced >= budget:
+        nonlocal produced, visited
+        if produced >= budget or visited >= node_budget:
             return
         if point == n_points:
             produced += 1
             yield list(chosen)
             return
         for position in candidates[point]:
-            key = (float(position[0]), float(position[1]), float(position[2]))
+            key = _position_key(position)
             if key in used:
                 continue
+            visited += 1
+            if visited >= node_budget:
+                return
             chosen.append(position)
-            used.append(key)
+            used.add(key)
             yield from walk(point + 1)
             chosen.pop()
-            used.pop()
+            used.discard(key)
             if produced >= budget:
                 return
 
     yield from walk(0)
+    # Report exhaustion through the counters the caller can see.
+    _LAST_SEARCH["produced"] = produced
+    _LAST_SEARCH["visited"] = visited
 
 
 def best_assignment_rmsd(
     query_points: np.ndarray,
     candidates: Sequence[Sequence[np.ndarray]],
     budget: int = DEFAULT_COMBINATION_BUDGET,
+    node_budget: int = DEFAULT_NODE_BUDGET,
 ) -> tuple[float, bool]:
     """Best RMSD over the assignments of candidate points to query points.
 
@@ -107,17 +151,24 @@ def best_assignment_rmsd(
         raise ValueError("one candidate group is required per query point")
     if any(len(group) == 0 for group in candidates):
         return float("inf"), True
-    if budget < 1:
+    if _too_few_positions(candidates):
+        # Settled without searching: the points cannot all be given a position
+        # of their own.
+        return float("inf"), True
+    if budget < 1 or node_budget < 1:
         return float("inf"), False
 
+    _LAST_SEARCH["produced"] = 0
+    _LAST_SEARCH["visited"] = 0
     best = float("inf")
     count = 0
-    for assignment in _distinct_assignments(candidates, budget):
+    for assignment in _distinct_assignments(candidates, budget, node_budget):
         count += 1
         best = min(best, kabsch_rmsd(np.vstack(assignment), query_points))
 
-    # The search is exhaustive unless it was cut off at the budget.
-    return best, count < budget
+    # A search that hit either ceiling has not ruled anything out.
+    exhausted = count >= budget or _LAST_SEARCH["visited"] >= node_budget
+    return best, not exhausted
 
 
 def group_positions_by_family(

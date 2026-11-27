@@ -100,10 +100,18 @@ def read_chunks(
         if chunksize < 1:
             raise InputError(f"chunksize must be >= 1, got {chunksize}")
         reader = pd.read_csv(path, chunksize=chunksize, **_LIBRARY_READ_OPTIONS)
+        seen = 0
         for index, frame in enumerate(reader):
             if index == 0:
                 require_smiles_column(frame.columns, str(path))
+            seen += 1
             yield index, frame
+        if seen == 0:
+            # A header with no records: yield the empty frame so that callers
+            # still produce their outputs, with the columns a caller expects.
+            frame = pd.read_csv(path, **_LIBRARY_READ_OPTIONS)
+            require_smiles_column(frame.columns, str(path))
+            yield 0, frame
     except pd.errors.EmptyDataError as exc:
         raise InputError(f"{path}: the CSV holds no data") from exc
     except pd.errors.ParserError as exc:

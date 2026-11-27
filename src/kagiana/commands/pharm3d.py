@@ -105,6 +105,10 @@ def run(args: argparse.Namespace) -> RunSummary:
     # the combined file is built by streaming these rather than by holding
     # every hit of the run in memory.
     hit_files: list[Path] = []
+    # Hits are counted per chunk as they are written. Counting the lines of the
+    # combined file instead would miscount a row whose own cells contain a
+    # newline.
+    hit_total = 0
     error_log = ErrorLog(args.out, resume=args.resume)
 
     for chunk_index, frame in csv_io.read_chunks(args.library, chunksize):
@@ -127,9 +131,10 @@ def run(args: argparse.Namespace) -> RunSummary:
                         summary.count_status(status)
                 error_log.keep_chunk(chunk_index)
                 hit_files.append(screened_target)
+                hit_total += csv_io.count_records(screened_target)
                 summary.outputs.extend([str(chunk_target), str(screened_target)])
                 continue
-            error_log.recompute_chunk(chunk_index)
+            error_log.start_chunk(chunk_index)
         else:
             chunk_target = Path(args.out)
             screened_target = csv_io.screened_path(args.out)
@@ -155,20 +160,26 @@ def run(args: argparse.Namespace) -> RunSummary:
                 detail=str(row.get("_detail", "")),
             )
 
-        csv_io.write_frame(scored, chunk_target, index=True)
+        # Make this chunk's diagnostics durable before its results appear:
+        # once both CSVs exist, a resumed run is entitled to skip the chunk,
+        # and anything still buffered would be lost.
+        error_log.finish_chunk()
+
         hits = scored[scored["numMatch"] > 0]
+        csv_io.write_frame(scored, chunk_target, index=True)
         csv_io.write_frame(hits, screened_target, index=True)
         summary.outputs.extend([str(chunk_target), str(screened_target)])
-        summary.n_screened += len(hits)
+        hit_total += len(hits)
         hit_files.append(screened_target)
 
     error_log.close()
+    summary.n_screened = hit_total
 
     if args.large:
         # Stream the finished per-chunk files into the combined one so that
         # peak memory stays at one chunk however many hits the run found.
         target = csv_io.screened_all_path(args.out)
-        summary.n_screened = _combine_hits(hit_files, target)
+        _combine_hits(hit_files, target)
         summary.outputs.append(str(target))
 
     if error_log.used:
@@ -181,24 +192,20 @@ def run(args: argparse.Namespace) -> RunSummary:
     return summary
 
 
-def _combine_hits(hit_files: list[Path], target: Path) -> int:
+def _combine_hits(hit_files: list[Path], target: Path) -> None:
     """Concatenate finished per-chunk hit files into one, keeping one header."""
     target.parent.mkdir(parents=True, exist_ok=True)
     temporary = target.with_suffix(target.suffix + ".part")
-    written = 0
     try:
         with open(temporary, "w", newline="", encoding="utf-8") as handle:
             for position, source in enumerate(hit_files):
-                written += csv_io.concat_csv_body(
-                    source, handle, header=position == 0
-                )
+                csv_io.concat_csv_body(source, handle, header=position == 0)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, target)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
-    return written
 
 
 def _screen_chunk(
@@ -279,7 +286,7 @@ def _row_from_result(result: Any, stage: str) -> dict[str, Any]:
             "elapsed_s": result.elapsed_s,
             "stage": stage,
             "best_rmsd": NAN,
-            "_detail": result.detail,
+            "_detail": "RDKit could not build a molecule from the SMILES string",
         }
     if result.status != Status.OK:
         return {
@@ -305,6 +312,12 @@ def _row_from_result(result: Any, stage: str) -> dict[str, Any]:
 
 def _attach_columns(frame: pd.DataFrame, rows: list[dict[str, Any]]) -> pd.DataFrame:
     scored = frame.copy()
+    if not rows:
+        # A library with a header and no records still gets a result file, and
+        # it has to carry the columns a caller expects to read.
+        for column in (*SCORE_COLUMNS_3D, *DIAGNOSTIC_COLUMNS_3D):
+            scored[column] = pd.Series(dtype="object")
+        return scored
     extra = pd.DataFrame(rows, index=scored.index)
     for column in (*SCORE_COLUMNS_3D, *DIAGNOSTIC_COLUMNS_3D):
         scored[column] = extra[column]

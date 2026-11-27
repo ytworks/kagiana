@@ -218,9 +218,15 @@ def _row_from_result(result: Any) -> dict[str, Any]:
 
 def _attach_columns(frame: pd.DataFrame, rows: list[dict[str, Any]]) -> pd.DataFrame:
     scored = frame.copy()
-    scores = pd.DataFrame(rows, index=scored.index)
+    if not rows:
+        # A library with a header and no records still gets a result file, and
+        # it has to carry the columns a caller expects to read.
+        for column in (*SCORE_COLUMNS_2D, *DIAGNOSTIC_COLUMNS_2D):
+            scored[column] = pd.Series(dtype="object")
+        return scored
+    extra = pd.DataFrame(rows, index=scored.index)
     for column in (*SCORE_COLUMNS_2D, *DIAGNOSTIC_COLUMNS_2D):
-        scored[column] = scores[column]
+        scored[column] = extra[column]
     return scored
 
 

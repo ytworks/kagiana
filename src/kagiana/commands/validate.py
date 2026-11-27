@@ -26,7 +26,14 @@ from ..schema import SMILES_COLUMN, InputError
 
 
 def _check_library(args: argparse.Namespace) -> tuple[dict[str, Any], str | None]:
-    """Walk the library as CSV records, reporting the first structural fault."""
+    """Walk the library as CSV records, reporting the first structural fault.
+
+    Two readers are used on purpose.  The csv module reports which record is
+    ragged, which is what a person needs in order to fix the file, but it also
+    tolerates a record left open by a missing quote.  The parser the screening
+    commands themselves use rejects that, so the file is also passed through it
+    — in chunks, so this stays cheap on a large library.
+    """
     header: list[str] = []
     records = 0
     for number, fields in csv_io.iter_records(args.library):
@@ -51,6 +58,13 @@ def _check_library(args: argparse.Namespace) -> tuple[dict[str, Any], str | None
 
     if not header:
         return {}, f"{args.library}: the CSV holds no data"
+
+    try:
+        # Same parser as a real run, so a file this accepts will parse there.
+        for _index, _frame in csv_io.read_chunks(args.library, 50_000):
+            pass
+    except InputError as exc:
+        return {}, f"{exc}"
 
     smiles_index = header.index(SMILES_COLUMN)
     first_smiles: str | None = None
@@ -163,12 +177,19 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
                     f"{args.query}: the reference SMILES could not be parsed: {smiles!r}",
                 )
             elif sig_factory is not None:
-                if fingerprint(smiles, sig_factory) is None:
+                # Generating the fingerprint can fail on a molecule RDKit parses
+                # happily, so the attempt belongs here rather than in a worker.
+                try:
+                    reference_fp = fingerprint(smiles, sig_factory)
+                except Exception as exc:  # noqa: BLE001
+                    reference_fp = None
                     fail(
                         "query",
                         f"{args.query}: no fingerprint could be generated for the "
-                        f"reference molecule {smiles!r}",
+                        f"reference molecule {smiles!r}: {type(exc).__name__}: {exc}",
                     )
+                if reference_fp is None:
+                    pass
                 else:
                     record(
                         "query",

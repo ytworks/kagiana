@@ -22,7 +22,7 @@ import numpy as np
 from ..features import load_feature_factory
 from ..geometry import best_assignment_rmsd, group_positions_by_family
 from ..molecules import mol_from_smiles
-from ..pharmacophore3d import read_feature_points
+from ..pharmacophore3d import make_pharmacophore, read_feature_points
 from ..progress import note, progress_bar
 from ..schema import InputError, Stage, Status
 
@@ -116,8 +116,13 @@ def prefilter_chunk(
     RDLogger.DisableLog("rdApp.*")
     _torch, _embed, _optimize, hardware_options = _require_gpu_modules()
 
+    from rdkit.Chem.Pharm3D import EmbedLib
+
     feature_factory = load_feature_factory(fdef_path)
     points = read_feature_points(pharmacophore_path)
+    # The same query object the constrained pass builds, so that the match
+    # column can be settled with the constrained pass's own predicate.
+    pharmacophore = make_pharmacophore(pharmacophore_path, limit_upper, limit_lower)
     query_types = [point.feature_type for point in points]
     query_coords = np.array([[p.x, p.y, p.z] for p in points], dtype=float)
 
@@ -151,7 +156,14 @@ def prefilter_chunk(
             # conformer ensemble is large, and holding the whole chunk's
             # ensembles would grow host memory with the chunk width.
             batch_positions = [position for position, _ in slice_]
-            batch = [Chem.AddHs(mol_from_smiles(smi)) for _, smi in slice_]
+            # Two representations of each molecule, and the difference matters.
+            # Embedding and feature geometry need explicit hydrogens, but a
+            # feature definition can be sensitive to them (a carbon is D1
+            # without them and D4 with them), so whether a molecule carries the
+            # required features is decided on the same representation the
+            # constrained pass uses.
+            base = [mol_from_smiles(smi) for _, smi in slice_]
+            batch = [Chem.AddHs(mol) for mol in base]
             try:
                 _embed_ensemble(batch, prefilter_conformers, hardware)
             except Exception as exc:  # noqa: BLE001
@@ -167,7 +179,7 @@ def prefilter_chunk(
                 batch.clear()
                 continue
 
-            for mol, position in zip(batch, batch_positions):
+            for mol, bare, position in zip(batch, base, batch_positions):
                 best, exhaustive = _best_rmsd_for_mol(
                     mol, feature_factory, query_types, query_coords
                 )
@@ -179,13 +191,26 @@ def prefilter_chunk(
                 # has not been ruled out, so it goes to the constrained pass
                 # instead of being recorded as a miss.
                 if exhaustive and np.isfinite(best) and best > prefilter_rmsd:
+                    # Ask the constrained pass's own question, on its own
+                    # molecule: does this carry the required features at all?
+                    # Anything else would disagree with a CPU run of the same
+                    # library for feature definitions that count hydrogens.
+                    try:
+                        carries_features = bool(
+                            EmbedLib.MatchPharmacophoreToMol(
+                                bare, feature_factory, pharmacophore
+                            )[0]
+                        )
+                    except Exception:  # noqa: BLE001
+                        # Undecidable here; let the constrained pass answer.
+                        bar.update(1)
+                        continue
                     decided[position] = {
-                        # The molecule does carry the required features: it is
-                        # the geometry that does not fit, and that is what the
-                        # stage column records.
-                        "match": True,
+                        # The geometry is what failed, and the stage column is
+                        # what records that.
+                        "match": carries_features,
                         "numMatch": 0,
-                        "status": Status.OK,
+                        "status": Status.OK if carries_features else Status.NO_FEATURE,
                         "elapsed_s": 0.0,
                         "stage": Stage.GPU_PREFILTER_REJECT,
                         "best_rmsd": best,
