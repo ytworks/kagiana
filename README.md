@@ -205,6 +205,22 @@ when each molecule was dispatched and **kills the worker outright** when
 is marked `timeout`, keeping the poses already embedded plus one for the
 assignment that was interrupted.
 
+### Measured scaling
+
+A 50,000-molecule library on a 12-core machine, with results identical at every
+job count:
+
+| Mode | `--jobs 1` | `--jobs 4` | `--jobs 12` |
+| --- | --- | --- | --- |
+| `pharm3d` | 24.8 s | 8.0 s | 4.0 s |
+| `pharm2d` | 4.3 s | 1.9 s | 1.3 s |
+
+Workers are started per chunk, and on platforms that spawn rather than fork
+each one re-imports RDKit. For a library of a few thousand molecules that
+startup can cost more than the screening itself, so `--jobs 1` is sometimes the
+faster choice there; the gain shows up once a chunk holds tens of thousands of
+molecules.
+
 ## GPU acceleration
 
 The CUDA path uses [nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit).
