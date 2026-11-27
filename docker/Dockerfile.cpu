@@ -1,0 +1,28 @@
+# CPU image: multicore screening, no GPU requirement.
+#
+#   docker build -f docker/Dockerfile.cpu -t kagiana:cpu .
+#   docker run --rm -v "$PWD/data:/work/data" -v "$PWD/results:/work/results" \
+#       kagiana:cpu backends
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1
+
+# RDKit's wheels need libXrender and libXext at runtime.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libxrender1 libxext6 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip install .
+
+# Screening reads from /work/data and writes to /work/results by convention;
+# mount host directories over them.
+WORKDIR /work
+RUN mkdir -p /work/data /work/results
+
+ENTRYPOINT ["kagiana"]
+CMD ["--help"]

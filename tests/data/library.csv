@@ -1,0 +1,11 @@
+ID,SMILES,vendor_note
+LIB-001,NCCc1ccc(O)cc1,dopamine-like
+LIB-002,NCCc1ccccc1,phenethylamine
+LIB-003,CCOc1ccccc1N,o-phenetidine
+LIB-004,c1ccccc1,benzene
+LIB-005,C,methane
+LIB-006,OCCNc1ccc(O)cc1,hydroxy analogue
+LIB-007,this-is-not-a-smiles,deliberately broken
+LIB-008,NCCc1ccc(OC)cc1,methoxy analogue
+LIB-009,CC(=O)Oc1ccccc1C(=O)O,aspirin
+LIB-010,NCCc1cc(O)ccc1O,catechol amine

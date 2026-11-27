@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint and documentation checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Lint
+        run: uv run --with 'ruff==0.17.6' ruff check .
+      - name: README.md and README.ja.md say the same thing
+        run: python scripts/check_readme_pair.py
+
+  test:
+    name: tests (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both supported platforms, and the next Python so a wheel gap shows up
+        # here rather than for a user. The start method differs between them —
+        # fork on Linux, spawn on macOS — and the worker pool is the part of
+        # this tool most sensitive to that, so both are run.
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install
+        run: uv sync --extra dev --python ${{ matrix.python }}
+      - name: Backends are reported without a GPU
+        # No CUDA on a runner, so the GPU path must report itself unavailable
+        # with reasons rather than failing.
+        run: |
+          uv run kagiana backends --json > backends.json
+          uv run python - <<'PY'
+          import json
+          report = json.load(open("backends.json"))
+          assert report["cpu"]["available"] is True, report["cpu"]
+          assert report["gpu"]["available"] is False, report["gpu"]
+          assert report["gpu"]["reasons"], "an unavailable GPU must say why"
+          print(f"cpu ok, gpu unavailable: {report['gpu']['reasons'][0]}")
+          PY
+      - name: Tests
+        run: uv run pytest -q --cov=kagiana --cov-report=term-missing
+      - name: Screening runs end to end
+        # The fixtures are small, so this is cheap, and it covers what the unit
+        # tests cannot: the CLI, the files it writes and its exit code.
+        run: |
+          uv run kagiana validate --library tests/data/library.csv \
+            --fdef tests/data/test.fdef \
+            --pharmacophore tests/data/pharmacophore.csv \
+            --params tests/data/params.json \
+            --query tests/data/query.csv --json
+          uv run kagiana pharm2d --library tests/data/library.csv \
+            --query tests/data/query.csv --fdef tests/data/test.fdef \
+            --params tests/data/params.json --out results/pharm2d.csv \
+            --json-summary results/pharm2d.json
+          uv run kagiana pharm3d --library tests/data/library.csv \
+            --pharmacophore tests/data/pharmacophore.csv \
+            --fdef tests/data/test.fdef --out results/pharm3d.csv \
+            --json-summary results/pharm3d.json
+          uv run python - <<'PY'
+          import json
+          for mode in ("pharm2d", "pharm3d"):
+            summary = json.load(open(f"results/{mode}.json"))
+            assert summary["n_total"] == 10, summary
+            assert summary["backend"] == "cpu", summary
+            print(f"{mode}: {summary['n_screened']} of {summary['n_total']} passed")
+          PY
+
+  docker:
+    name: docker image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the CPU image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.cpu
+          push: false
+          load: true
+          tags: kagiana:ci
+      - name: Smoke test the image
+        run: |
+          docker run --rm kagiana:ci --version
+          docker run --rm kagiana:ci backends --json | python -c "import json,sys; d=json.load(sys.stdin); assert d['cpu']['available'], d['cpu']; print('backends ok')"
+          docker run --rm -v "$PWD/tests/data:/work/data:ro" kagiana:ci \
+            validate --library /work/data/library.csv --fdef /work/data/test.fdef --json \
+            | python -c "import json,sys; d=json.load(sys.stdin); assert d['ok'], d['errors']; print('validate ok')"

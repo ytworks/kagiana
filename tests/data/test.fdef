@@ -1,0 +1,35 @@
+# Minimal feature definitions for the test fixtures.
+AtomType NDonor [$([Nv3](-C)(-C)-C),$([Nv3;H1,H2](-C)),$([Nv3;H2](-C))]
+AtomType ODonor [$([OX2H1]-[#6])]
+AtomType AcceptorO [$([OX1]=[#6,#7,#16]),$([OX2H1]-[#6]),$([OX2](-[#6])-[#6])]
+AtomType AcceptorN [$([NX1]#[#6]),$([nX2]([#6])[#6])]
+
+DefineFeature SingleAtomDonor [{NDonor},{ODonor}]
+  Family Donor
+  Weights 1
+EndFeature
+
+DefineFeature SingleAtomAcceptor [{AcceptorO},{AcceptorN}]
+  Family Acceptor
+  Weights 1
+EndFeature
+
+DefineFeature AromaticRing6 a1aaaaa1
+  Family Aromatic
+  Weights 1,1,1,1,1,1
+EndFeature
+
+DefineFeature AromaticRing5 a1aaaa1
+  Family Aromatic
+  Weights 1,1,1,1,1
+EndFeature
+
+DefineFeature Carboxylate [CX3](=O)[OX1H0-,OX2H1]
+  Family NegIonizable
+  Weights 1,1,1
+EndFeature
+
+DefineFeature BasicAmine [$([NX3;H2,H1;!$(N[#6]=[O,N,S])]),$([NX3](C)(C)C)]
+  Family PosIonizable
+  Weights 1
+EndFeature

@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kagiana"
+version = "0.1.0"
+description = "Pharmacophore screening CLI (2D / 3D) with multicore and GPU acceleration"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+    "rdkit>=2023.9.1",
+    "pandas>=2.0",
+    "numpy>=1.24",
+    "tqdm>=4.65",
+]
+
+[project.optional-dependencies]
+gpu = ["nvmolkit", "torch"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+]
+
+[project.scripts]
+kagiana = "kagiana.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kagiana"]
+
+[project.urls]
+Homepage = "https://github.com/ytworks/kagiana"
+Source = "https://github.com/ytworks/kagiana"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "gpu: needs a CUDA GPU with nvmolkit",
+    "slow: long running",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["build", "dist", "results"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "C4", "SIM"]
+ignore = [
+    "B905",  # zip() over sequences of equal length by construction
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Both of these keep a file handle open across calls on purpose: the temporary
+# result file outlives the function that creates it, and a chunk's diagnostics
+# stay open until that chunk is finished.
+"src/kagiana/csv_io.py" = ["SIM115"]
+"src/kagiana/errlog.py" = ["SIM115"]
+# Nested context managers read better here than one combined statement: the
+# outer one is the pool, the inner the iteration over its results.
+"tests/*" = ["SIM117"]
+
+[tool.coverage.run]
+source = ["kagiana"]
+branch = true

@@ -1,0 +1,41 @@
+# Screening in a container, with the host's data and results mounted.
+#
+#   docker compose -f docker/docker-compose.yml --profile cpu build
+#   docker compose -f docker/docker-compose.yml --profile cpu run --rm cpu backends
+#
+#   docker compose -f docker/docker-compose.yml --profile gpu build
+#   docker compose -f docker/docker-compose.yml --profile gpu run --rm gpu backends
+#
+# Paths inside the container: /work/data for inputs, /work/results for outputs.
+services:
+  cpu:
+    profiles: ["cpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.cpu
+    image: kagiana:cpu
+    volumes:
+      - ../data:/work/data
+      - ../results:/work/results
+    working_dir: /work
+
+  gpu:
+    profiles: ["gpu"]
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.gpu
+      # The GPU extension ships x86_64 wheels only.
+      platforms:
+        - linux/amd64
+    image: kagiana:gpu
+    volumes:
+      - ../data:/work/data
+      - ../results:/work/results
+    working_dir: /work
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]

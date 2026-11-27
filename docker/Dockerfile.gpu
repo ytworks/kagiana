@@ -1,0 +1,47 @@
+# GPU image: adds the CUDA screening path on top of the CPU one.
+#
+# The GPU extension publishes x86_64 Linux wheels only, so this image must be
+# built for linux/amd64 and run on a host with an NVIDIA driver:
+#
+#   docker build --platform linux/amd64 -f docker/Dockerfile.gpu -t kagiana:gpu .
+#   docker run --rm --gpus all kagiana:gpu backends
+#
+# Host requirements: an NVIDIA GPU of compute capability 7.0 or newer, driver
+# 560.28 or newer (CUDA 12.6+), and the NVIDIA Container Toolkit so that
+# --gpus all works.
+FROM nvidia/cuda:12.9.1-runtime-ubuntu24.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3 python3-venv python3-pip libxrender1 libxext6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# A virtual environment keeps pip away from the distribution's own packages.
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv "$VIRTUAL_ENV"
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
+RUN pip install --upgrade pip
+
+# Torch first, from the CUDA 12.8 index, because the GPU extension expects a
+# CUDA build of it rather than the default CPU wheels.
+RUN pip install torch --index-url https://download.pytorch.org/whl/cu128
+
+# The GPU extension pins the RDKit version it was built against, so install it
+# before this project and then add this project without touching that pin.
+RUN pip install nvmolkit
+
+WORKDIR /src
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip install pandas numpy tqdm && pip install --no-deps .
+
+WORKDIR /work
+RUN mkdir -p /work/data /work/results
+
+ENTRYPOINT ["kagiana"]
+CMD ["--help"]
