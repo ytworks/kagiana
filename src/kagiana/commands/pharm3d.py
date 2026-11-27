@@ -165,10 +165,11 @@ def _screen_chunk(
 ) -> list[dict[str, Any]]:
     """Screen one chunk, optionally using the GPU prefilter first."""
     prefilter: dict[int, dict[str, Any]] = {}
+    prefilter_rmsd: dict[int, float] = {}
     if backend == GPU:
         from ..backends import gpu3d
 
-        prefilter = gpu3d.prefilter_chunk(
+        prefilter, prefilter_rmsd = gpu3d.prefilter_chunk(
             smiles,
             fdef_path=str(args.fdef),
             pharmacophore_path=str(args.pharmacophore),
@@ -204,7 +205,11 @@ def _screen_chunk(
                 timeout=args.timeout,
             ) as pool:
                 for result in pool.map_ordered([smiles[i] for i in todo]):
-                    rows[todo[result.index]] = _row_from_result(result, stage)
+                    position = todo[result.index]
+                    row = _row_from_result(result, stage)
+                    # Carry the prefilter's fit through to the surviving rows.
+                    row["best_rmsd"] = prefilter_rmsd.get(position, NAN)
+                    rows[position] = row
                     bar.update(1)
     return rows
 
