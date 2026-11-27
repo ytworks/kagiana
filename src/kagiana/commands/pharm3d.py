@@ -16,6 +16,7 @@ embedded plus one for the assignment that was interrupted.
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -44,9 +45,15 @@ NAN = float("nan")
 def run(args: argparse.Namespace) -> RunSummary:
     started = monotonic()
 
-    # Validate the query before starting workers.
-    from ..pharmacophore3d import make_pharmacophore
+    # Validate the query before starting workers: a misspelt feature family
+    # would otherwise match nothing and come back as a clean run with no hits.
+    from ..pharmacophore3d import (
+        make_pharmacophore,
+        read_feature_points,
+        require_known_feature_types,
+    )
 
+    require_known_feature_types(read_feature_points(args.pharmacophore), args.fdef)
     make_pharmacophore(args.pharmacophore, args.limit_upper, args.limit_lower)
 
     if args.conformers < 1:
@@ -76,16 +83,29 @@ def run(args: argparse.Namespace) -> RunSummary:
     jobs = args.jobs or default_jobs()
     chunksize = args.chunksize if args.large else None
 
-    if not args.large and args.resume and Path(args.out).is_file():
-        message = f"resume: {args.out} already exists, nothing to do"
+    whole_file_outputs = (Path(args.out), csv_io.screened_path(args.out))
+    if (
+        not args.large
+        and args.resume
+        and all(target.is_file() for target in whole_file_outputs)
+    ):
+        message = f"resume: {args.out} is already complete, nothing to do"
         summary.notes.append(message)
         note(message, args.quiet)
-        summary.outputs.append(str(args.out))
+        summary.outputs.extend(str(target) for target in whole_file_outputs)
+        for status, count in csv_io.read_status_counts(args.out).items():
+            for _ in range(count):
+                summary.count_status(status)
+        summary.n_total = csv_io.count_records(args.out)
+        summary.n_screened = csv_io.count_records(csv_io.screened_path(args.out))
         summary.elapsed_s = monotonic() - started
         return summary
 
-    screened_frames: list[pd.DataFrame] = []
-    error_log = ErrorLog(args.out)
+    # Chunk files finished in an earlier run, in the order they were written:
+    # the combined file is built by streaming these rather than by holding
+    # every hit of the run in memory.
+    hit_files: list[Path] = []
+    error_log = ErrorLog(args.out, resume=args.resume)
 
     for chunk_index, frame in csv_io.read_chunks(args.library, chunksize):
         summary.n_chunks += 1
@@ -94,14 +114,22 @@ def run(args: argparse.Namespace) -> RunSummary:
             chunk_target = csv_io.numbered_path(args.out, chunk_index)
             screened_target = csv_io.screened_numbered_path(args.out, chunk_index)
             if args.resume and chunk_target.is_file() and screened_target.is_file():
+                # Both files are written atomically, so their presence means
+                # the chunk really finished rather than having been cut off
+                # partway through a write.
                 message = f"resume: chunk {chunk_index} already written, skipping"
                 summary.notes.append(message)
                 note(message, args.quiet)
-                done = pd.read_csv(screened_target, index_col=0)
-                screened_frames.append(done)
-                summary.n_total += len(pd.read_csv(chunk_target, index_col=0))
+                summary.n_total += csv_io.count_records(chunk_target)
+                # Failures recorded earlier still belong in this run's summary.
+                for status, count in csv_io.read_status_counts(chunk_target).items():
+                    for _ in range(count):
+                        summary.count_status(status)
+                error_log.keep_chunk(chunk_index)
+                hit_files.append(screened_target)
                 summary.outputs.extend([str(chunk_target), str(screened_target)])
                 continue
+            error_log.recompute_chunk(chunk_index)
         else:
             chunk_target = Path(args.out)
             screened_target = csv_io.screened_path(args.out)
@@ -131,19 +159,16 @@ def run(args: argparse.Namespace) -> RunSummary:
         hits = scored[scored["numMatch"] > 0]
         csv_io.write_frame(hits, screened_target, index=True)
         summary.outputs.extend([str(chunk_target), str(screened_target)])
-        screened_frames.append(hits)
+        summary.n_screened += len(hits)
+        hit_files.append(screened_target)
 
     error_log.close()
-    all_hits = (
-        pd.concat(screened_frames, ignore_index=True)
-        if screened_frames
-        else pd.DataFrame()
-    )
-    summary.n_screened = len(all_hits)
 
     if args.large:
+        # Stream the finished per-chunk files into the combined one so that
+        # peak memory stays at one chunk however many hits the run found.
         target = csv_io.screened_all_path(args.out)
-        csv_io.write_frame(all_hits, target, index=True)
+        summary.n_screened = _combine_hits(hit_files, target)
         summary.outputs.append(str(target))
 
     if error_log.used:
@@ -154,6 +179,26 @@ def run(args: argparse.Namespace) -> RunSummary:
 
     summary.elapsed_s = monotonic() - started
     return summary
+
+
+def _combine_hits(hit_files: list[Path], target: Path) -> int:
+    """Concatenate finished per-chunk hit files into one, keeping one header."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_suffix(target.suffix + ".part")
+    written = 0
+    try:
+        with open(temporary, "w", newline="", encoding="utf-8") as handle:
+            for position, source in enumerate(hit_files):
+                written += csv_io.concat_csv_body(
+                    source, handle, header=position == 0
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return written
 
 
 def _screen_chunk(

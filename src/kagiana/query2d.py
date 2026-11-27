@@ -12,12 +12,12 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.Pharm2D import Generate
 from rdkit.Chem.Pharm2D.SigFactory import SigFactory
 
 from .features import load_feature_factory
+from .molecules import mol_from_smiles
 from .schema import (
     MIN_POINT_COUNT_2D,
     PARAMS_KEYS_2D,
@@ -142,7 +142,7 @@ def build_sig_factory(fdef_path: str | Path, params: Params2D) -> SigFactory:
 
 def fingerprint(smiles: str, sig_factory: SigFactory) -> Any:
     """2D pharmacophore fingerprint of a SMILES string, or ``None`` if unparsable."""
-    mol = Chem.MolFromSmiles(smiles)
+    mol = mol_from_smiles(smiles)
     if mol is None:
         return None
     AllChem.Compute2DCoords(mol)

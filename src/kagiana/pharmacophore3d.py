@@ -10,6 +10,7 @@ for a molecule to match; there is no partial-match mode.
 from __future__ import annotations
 
 import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from rdkit import Geometry
 from rdkit.Chem import ChemicalFeatures
 from rdkit.Chem.Pharm3D import Pharmacophore
 
+from .features import feature_families
 from .schema import FEATURE_COORD_COLUMNS, FEATURE_TYPE_COLUMN, InputError
 
 DEFAULT_LIMIT_UPPER = 1.5
@@ -57,11 +59,17 @@ def read_feature_points(pharmacophore_path: str | Path) -> list[FeaturePoint]:
             for name in FEATURE_COORD_COLUMNS:
                 raw = row.get(name)
                 try:
-                    coords.append(float(raw))
+                    value = float(raw)
                 except (TypeError, ValueError):
                     raise InputError(
                         f"{path}:{lineno}: column {name} is not a number: {raw!r}"
                     ) from None
+                if not math.isfinite(value):
+                    raise InputError(
+                        f"{path}:{lineno}: column {name} must be a finite "
+                        f"coordinate, got {raw!r}"
+                    )
+                coords.append(value)
             points.append(FeaturePoint(feature_type, *coords))
 
     if len(points) < 2:
@@ -69,6 +77,26 @@ def read_feature_points(pharmacophore_path: str | Path) -> list[FeaturePoint]:
             f"{path}: at least 2 feature points are required, found {len(points)}"
         )
     return points
+
+
+def require_known_feature_types(
+    points: list[FeaturePoint], fdef_path: str | Path
+) -> None:
+    """Fail when a query asks for a feature family the fdef does not define.
+
+    A misspelt family matches nothing, which would otherwise look exactly like
+    a library in which no molecule carries the required features: a clean run
+    reporting zero hits.  Both the pre-flight check and the screening commands
+    go through here so that such a query is an input error either way.
+    """
+    known = set(feature_families(fdef_path))
+    unknown = sorted({point.feature_type for point in points} - known)
+    if unknown:
+        raise InputError(
+            "feature type(s) not defined by the fdef file "
+            f"{fdef_path}: {', '.join(unknown)} "
+            f"(defined: {', '.join(sorted(known))})"
+        )
 
 
 def make_pharmacophore(

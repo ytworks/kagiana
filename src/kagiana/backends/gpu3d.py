@@ -21,6 +21,7 @@ import numpy as np
 
 from ..features import load_feature_factory
 from ..geometry import best_assignment_rmsd, group_positions_by_family
+from ..molecules import mol_from_smiles
 from ..pharmacophore3d import read_feature_points
 from ..progress import note, progress_bar
 from ..schema import InputError, Stage, Status
@@ -65,18 +66,31 @@ def _best_rmsd_for_mol(
     feature_factory: Any,
     query_types: list[str],
     query_coords: np.ndarray,
-) -> float:
-    """Best fit of any conformer of a molecule onto the query points."""
+) -> tuple[float, bool]:
+    """Best fit of any conformer of a molecule onto the query points.
+
+    Returns the smallest RMSD found and whether every conformer was searched
+    exhaustively.  A molecule with no conformers, or one whose conformers never
+    present all the required families, comes back as infinity; the caller sends
+    those to the constrained pass rather than deciding them here.
+    """
     best = float("inf")
+    exhaustive = True
+    measured = False
     for conformer in mol.GetConformers():
         features = feature_factory.GetFeaturesForMol(mol, confId=conformer.GetId())
         grouped = group_positions_by_family(features)
         candidates = [grouped.get(family, []) for family in query_types]
         if any(len(group) == 0 for group in candidates):
-            # This molecule cannot present the required families at all.
-            return float("inf")
-        best = min(best, best_assignment_rmsd(query_coords, candidates))
-    return best
+            # This conformer cannot present the required families.
+            continue
+        rmsd, complete = best_assignment_rmsd(query_coords, candidates)
+        exhaustive = exhaustive and complete
+        measured = True
+        best = min(best, rmsd)
+    if not measured:
+        return float("inf"), True
+    return best, exhaustive
 
 
 def prefilter_chunk(
@@ -112,11 +126,12 @@ def prefilter_chunk(
     decided: dict[int, dict[str, Any]] = {}
     rmsd_by_position: dict[int, float] = {}
 
-    positions: list[int] = []
-    mols: list[Any] = []
+    # Unparsable rows need no conformers, so they are settled before anything
+    # is embedded; the rest are kept as SMILES and turned into molecules one
+    # batch at a time.
+    pending: list[tuple[int, str]] = []
     for position, smi in enumerate(smiles):
-        mol = Chem.MolFromSmiles(smi)
-        if mol is None:
+        if mol_from_smiles(smi) is None:
             decided[position] = {
                 "match": False,
                 "numMatch": 0,
@@ -127,13 +142,16 @@ def prefilter_chunk(
                 "_detail": "RDKit could not parse the SMILES string",
             }
             continue
-        positions.append(position)
-        mols.append(Chem.AddHs(mol))
+        pending.append((position, smi))
 
-    with progress_bar(len(mols), "pharm3d gpu prefilter", quiet) as bar:
-        for start in range(0, len(mols), batch_size):
-            batch = mols[start : start + batch_size]
-            batch_positions = positions[start : start + batch_size]
+    with progress_bar(len(pending), "pharm3d gpu prefilter", quiet) as bar:
+        for start_index in range(0, len(pending), batch_size):
+            slice_ = pending[start_index : start_index + batch_size]
+            # Molecules are built per batch and dropped at the end of it: a
+            # conformer ensemble is large, and holding the whole chunk's
+            # ensembles would grow host memory with the chunk width.
+            batch_positions = [position for position, _ in slice_]
+            batch = [Chem.AddHs(mol_from_smiles(smi)) for _, smi in slice_]
             try:
                 _embed_ensemble(batch, prefilter_conformers, hardware)
             except Exception as exc:  # noqa: BLE001
@@ -146,24 +164,36 @@ def prefilter_chunk(
                     quiet,
                 )
                 bar.update(len(batch))
+                batch.clear()
                 continue
 
             for mol, position in zip(batch, batch_positions):
-                best = _best_rmsd_for_mol(
+                best, exhaustive = _best_rmsd_for_mol(
                     mol, feature_factory, query_types, query_coords
                 )
-                rmsd_by_position[position] = best
-                if not np.isfinite(best) or best > prefilter_rmsd:
+                if np.isfinite(best):
+                    rmsd_by_position[position] = best
+                # Only a measured fit that is exhaustive and clearly too far
+                # off is settled here.  A molecule whose ensemble produced no
+                # usable conformer, or whose search hit the assignment budget,
+                # has not been ruled out, so it goes to the constrained pass
+                # instead of being recorded as a miss.
+                if exhaustive and np.isfinite(best) and best > prefilter_rmsd:
                     decided[position] = {
-                        "match": False,
+                        # The molecule does carry the required features: it is
+                        # the geometry that does not fit, and that is what the
+                        # stage column records.
+                        "match": True,
                         "numMatch": 0,
-                        "status": Status.NO_FEATURE,
+                        "status": Status.OK,
                         "elapsed_s": 0.0,
                         "stage": Stage.GPU_PREFILTER_REJECT,
-                        "best_rmsd": best if np.isfinite(best) else NAN,
+                        "best_rmsd": best,
                         "_detail": "",
                     }
                 bar.update(1)
+
+            batch.clear()
 
     kept = len(smiles) - len(decided)
     note(

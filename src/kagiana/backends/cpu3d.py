@@ -15,11 +15,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from rdkit import Chem, RDLogger
+from rdkit import RDLogger
 from rdkit.Chem import AllChem, rdDistGeom
 from rdkit.Chem.Pharm3D import EmbedLib
 
 from ..features import load_feature_factory
+from ..molecules import mol_from_smiles
 from ..pharmacophore3d import make_pharmacophore
 from ..pool import report_progress
 
@@ -52,7 +53,7 @@ def screen_molecule(
     max_generate_poses: int,
 ) -> Score3D | None:
     """Screen one SMILES string, or return ``None`` if RDKit cannot parse it."""
-    mol = Chem.MolFromSmiles(smiles)
+    mol = mol_from_smiles(smiles)
     if mol is None:
         return None
     AllChem.Compute2DCoords(mol)
@@ -72,18 +73,28 @@ def screen_molecule(
 
     poses = 0
     for assignment in assignments:
+        remaining = max_generate_poses - poses
+        if remaining <= 0:
+            # The ceiling has been reached exactly; generating more would
+            # report a count the caller did not ask for.
+            break
         atom_ids = [feature.GetAtomIds() for feature in assignment]
         report_progress(Partial3D(True, poses, True))
         try:
             _bounds, embeds, _n_fail = EmbedLib.EmbedPharmacophore(
-                mol, atom_ids, pharmacophore, count=n_conformers, silent=1
+                mol,
+                atom_ids,
+                pharmacophore,
+                # Never ask for more poses than the remaining budget, so that
+                # an assignment which embeds only part of what it was asked
+                # for still cannot push the total over the ceiling.
+                count=min(n_conformers, remaining),
+                silent=1,
             )
         except Exception:  # noqa: BLE001 - a single assignment may be unembeddable
             continue
         poses += len(embeds)
         report_progress(Partial3D(True, poses, False))
-        if poses > max_generate_poses:
-            break
 
     return Score3D(True, poses)
 

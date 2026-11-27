@@ -21,7 +21,12 @@ from ..backends import CPU, GPU, resolve_backend
 from ..backends.cpu2d import init_worker as cpu_init_worker
 from ..pool import KillableWorkerPool, default_jobs
 from ..progress import note, progress_bar
-from ..query2d import build_sig_factory, load_params, read_reference_smiles
+from ..query2d import (
+    build_sig_factory,
+    load_params,
+    read_reference_smiles,
+    reference_fingerprint,
+)
 from ..schema import (
     DIAGNOSTIC_COLUMNS_2D,
     SCORE_COLUMNS_2D,
@@ -44,9 +49,11 @@ def run(args: argparse.Namespace) -> RunSummary:
         chunksize=args.chunksize,
     )
     reference_smiles = read_reference_smiles(args.query)
-    # Build the signature factory here too: a bad fdef or an unknown feature
-    # family should fail before any worker is started.
-    build_sig_factory(args.fdef, params)
+    # Build the signature factory and the reference fingerprint here too: a bad
+    # fdef, an unknown feature family or an unreadable reference molecule should
+    # be an input error before any worker is started, not a worker that fails
+    # to initialise once the run is under way.
+    reference_fingerprint(reference_smiles, build_sig_factory(args.fdef, params))
 
     backend, probe, notes = resolve_backend(args.backend)
     if backend == GPU and not probe.available:

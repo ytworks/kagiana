@@ -10,8 +10,7 @@ expensive pass.
 
 from __future__ import annotations
 
-from itertools import product
-from typing import Iterable, Sequence
+from typing import Iterable, Iterator, Sequence
 
 import numpy as np
 
@@ -45,48 +44,80 @@ def kabsch_rmsd(mobile: np.ndarray, target: np.ndarray) -> float:
     return float(np.sqrt((deviation**2).sum() / len(mobile)))
 
 
-def _limit_candidates(
+def _distinct_assignments(
     candidates: Sequence[Sequence[np.ndarray]], budget: int
-) -> list[list[np.ndarray]]:
-    """Trim per-point candidate lists until the assignment count fits a budget."""
-    trimmed = [list(group) for group in candidates]
-    while trimmed:
-        total = 1
-        for group in trimmed:
-            total *= max(1, len(group))
-        if total <= budget:
-            return trimmed
-        widest = max(range(len(trimmed)), key=lambda i: len(trimmed[i]))
-        if len(trimmed[widest]) <= 1:
-            return trimmed
-        trimmed[widest] = trimmed[widest][:-1]
-    return trimmed
+) -> Iterator[list[np.ndarray]]:
+    """Enumerate assignments that give each query point a distinct position.
+
+    A query may name the same feature family more than once, in which case the
+    same candidate positions are offered for several points.  Only assignments
+    that use a position once are chemically meaningful, so they are built by
+    backtracking over the positions still free rather than by filtering a full
+    cartesian product afterwards: with six points of one family there are 720
+    valid assignments among 46,656 combinations, and trimming the candidate
+    lists to fit the product would throw away every valid one.
+
+    The budget counts assignments actually produced.  Stopping early is
+    reported by the caller rather than silently returning the best of a partial
+    search, because a search that could not finish has not ruled anything out.
+    """
+    n_points = len(candidates)
+    produced = 0
+    chosen: list[np.ndarray] = []
+    used: list[tuple[float, float, float]] = []
+
+    def walk(point: int) -> Iterator[list[np.ndarray]]:
+        nonlocal produced
+        if produced >= budget:
+            return
+        if point == n_points:
+            produced += 1
+            yield list(chosen)
+            return
+        for position in candidates[point]:
+            key = (float(position[0]), float(position[1]), float(position[2]))
+            if key in used:
+                continue
+            chosen.append(position)
+            used.append(key)
+            yield from walk(point + 1)
+            chosen.pop()
+            used.pop()
+            if produced >= budget:
+                return
+
+    yield from walk(0)
 
 
 def best_assignment_rmsd(
     query_points: np.ndarray,
     candidates: Sequence[Sequence[np.ndarray]],
     budget: int = DEFAULT_COMBINATION_BUDGET,
-) -> float:
-    """Smallest RMSD over all ways of assigning candidate points to query points.
+) -> tuple[float, bool]:
+    """Best RMSD over the assignments of candidate points to query points.
 
     ``candidates[i]`` holds the positions in the conformer that could play the
-    role of query point ``i`` (its feature family).  A point with no candidate
-    makes the molecule unfittable, reported as infinity.
+    role of query point ``i`` (its feature family).  Returns the smallest RMSD
+    found and whether the search was exhaustive.  A non-exhaustive search means
+    the budget ran out: the answer is an upper bound, and the caller must not
+    reject a molecule on it.  A query point with no candidate at all is
+    conclusive, and reports infinity with the search complete.
     """
     if len(candidates) != len(query_points):
         raise ValueError("one candidate group is required per query point")
     if any(len(group) == 0 for group in candidates):
-        return float("inf")
+        return float("inf"), True
+    if budget < 1:
+        return float("inf"), False
 
     best = float("inf")
-    for combination in product(*_limit_candidates(candidates, budget)):
-        # Two query points must not be served by the same position.
-        stacked = np.vstack(combination)
-        if len(np.unique(stacked, axis=0)) < len(stacked):
-            continue
-        best = min(best, kabsch_rmsd(stacked, query_points))
-    return best
+    count = 0
+    for assignment in _distinct_assignments(candidates, budget):
+        count += 1
+        best = min(best, kabsch_rmsd(np.vstack(assignment), query_points))
+
+    # The search is exhaustive unless it was cut off at the budget.
+    return best, count < budget
 
 
 def group_positions_by_family(

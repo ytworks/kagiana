@@ -40,8 +40,15 @@ def test_chunked_mode_splits_the_library(library: Path) -> None:
     assert [index for index, _frame in chunks] == [0, 1, 2]
 
 
-def test_row_count_matches_the_frame(library: Path) -> None:
-    assert csv_io.count_rows(library) == 10
+def test_record_count_matches_the_frame(library: Path) -> None:
+    assert csv_io.count_records(library) == 10
+
+
+def test_records_are_counted_not_lines(tmp_path: Path) -> None:
+    """A field holding a newline is one record, not two."""
+    path = tmp_path / "quoted.csv"
+    path.write_text('SMILES,note\nCCO,"first line\nsecond line"\n', encoding="utf-8")
+    assert csv_io.count_records(path) == 1
 
 
 def test_a_missing_library_is_an_input_error(tmp_path: Path) -> None:

@@ -60,16 +60,49 @@ def test_best_assignment_picks_the_right_pairing() -> None:
         [query[2], query[1]],
         [query[0], query[2]],
     ]
-    assert best_assignment_rmsd(query, candidates) == pytest.approx(0.0, abs=1e-9)
+    best, exhaustive = best_assignment_rmsd(query, candidates)
+    assert best == pytest.approx(0.0, abs=1e-9)
+    assert exhaustive is True
 
 
-def test_missing_candidate_makes_a_molecule_unfittable() -> None:
+def test_missing_candidate_is_conclusive() -> None:
     query = _triangle()
-    assert best_assignment_rmsd(query, [[query[0]], [], [query[2]]]) == float("inf")
+    best, exhaustive = best_assignment_rmsd(query, [[query[0]], [], [query[2]]])
+    assert best == float("inf")
+    # Nothing can be assigned, so there is nothing left to search.
+    assert exhaustive is True
 
 
-def test_budget_limits_the_search_without_failing() -> None:
+def test_a_repeated_family_keeps_its_valid_assignments() -> None:
+    """A query naming one family several times must still find an exact fit.
+
+    Trimming candidate lists to fit a cartesian product would discard every
+    valid assignment here: six points of one family have 46,656 combinations
+    but only 720 that use each position once.
+    """
+    query = np.array(
+        [[0.0, 0.0, 0.0], [3.0, 0.0, 0.0], [0.0, 4.0, 0.0],
+         [1.0, 1.0, 5.0], [2.0, -3.0, 1.0], [-4.0, 1.0, 2.0]]
+    )
+    candidates = [[query[i] for i in range(len(query))] for _ in range(len(query))]
+    best, exhaustive = best_assignment_rmsd(query, candidates)
+    assert best == pytest.approx(0.0, abs=1e-9)
+    assert exhaustive is True
+
+
+def test_a_position_is_never_used_twice() -> None:
     query = _triangle()
-    wide = [[np.array([float(i), 0.0, 0.0]) for i in range(30)] for _ in range(3)]
-    result = best_assignment_rmsd(query, wide, budget=50)
-    assert math.isfinite(result)
+    # Only two distinct positions are on offer for three query points.
+    candidates = [[query[0], query[1]], [query[0], query[1]], [query[0], query[1]]]
+    best, exhaustive = best_assignment_rmsd(query, candidates)
+    assert best == float("inf")
+    assert exhaustive is True
+
+
+def test_an_exhausted_budget_is_reported_as_inconclusive() -> None:
+    """A search cut short has ruled nothing out, and must say so."""
+    query = _triangle()
+    wide = [[np.array([float(i), float(j), 0.0]) for i in range(30)] for j in range(3)]
+    best, exhaustive = best_assignment_rmsd(query, wide, budget=50)
+    assert math.isfinite(best)
+    assert exhaustive is False

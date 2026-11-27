@@ -27,8 +27,11 @@ from typing import Any, Callable, Iterable, Iterator, Sequence
 
 from .schema import Status
 
-#: How often the parent wakes up to re-check deadlines.
+#: Longest the parent waits for a worker before re-checking deadlines.
 _POLL_INTERVAL = 0.05
+
+#: Attempts allowed at building a worker's state before the run is abandoned.
+_MAX_INIT_FAILURES = 1
 
 _STARTING = "starting"
 _IDLE = "idle"
@@ -280,7 +283,7 @@ class KillableWorkerPool:
                 slot.conn for slot in self._slots if slot.state in (_BUSY, _STARTING)
             ]
             if open_conns:
-                for conn in wait(open_conns, timeout=_POLL_INTERVAL):
+                for conn in wait(open_conns, timeout=self._next_wait()):
                     position, slot = self._find(conn)
                     if slot is None:
                         continue
@@ -289,6 +292,23 @@ class KillableWorkerPool:
                         buffered[result.index] = result
 
             self._enforce_deadlines(buffered)
+
+    def _next_wait(self) -> float:
+        """How long to wait for a worker before re-checking the deadlines.
+
+        Waiting the full poll interval would let a task that overran its
+        deadline deliver a result first and be accepted as a success, so the
+        wait never extends past the nearest deadline.
+        """
+        if not self._timeout:
+            return _POLL_INTERVAL
+        now = monotonic()
+        remaining = [
+            slot.deadline - now for slot in self._slots if slot.state == _BUSY
+        ]
+        if not remaining:
+            return _POLL_INTERVAL
+        return max(0.0, min(_POLL_INTERVAL, min(remaining)))
 
     def _find(self, conn: Connection) -> tuple[int, _Slot | None]:
         for position, slot in enumerate(self._slots):
@@ -313,11 +333,22 @@ class KillableWorkerPool:
                 )
                 self._slots[position] = self._replace(slot)
                 return failed
-            self._slots[position] = self._replace(slot, slot.init_failures)
+            # The worker died before reporting itself ready.  Counting this
+            # against the retry budget is what stops an unusable worker from
+            # being respawned for ever; a task deadline cannot help here,
+            # because no task was ever dispatched to it.
+            exit_code = slot.process.exitcode
+            if slot.init_failures >= _MAX_INIT_FAILURES:
+                raise WorkerInitError(
+                    "a worker process exited before it finished starting up "
+                    f"(exit code {exit_code}) after "
+                    f"{slot.init_failures + 1} attempts"
+                )
+            self._slots[position] = self._replace(slot, slot.init_failures + 1)
             return None
 
         if kind == "init_error":
-            if slot.init_failures >= 1:
+            if slot.init_failures >= _MAX_INIT_FAILURES:
                 raise WorkerInitError(str(payload))
             self._slots[position] = self._replace(slot, slot.init_failures + 1)
             return None
@@ -331,9 +362,24 @@ class KillableWorkerPool:
             return None
 
         index, body = payload
-        elapsed = monotonic() - slot.dispatched_at
+        now = monotonic()
+        elapsed = now - slot.dispatched_at
+        overran = self._timeout is not None and now > slot.deadline
+        progress = slot.progress
         slot.state = _IDLE
         slot.index = -1
+        if overran:
+            # The work finished, but not within the deadline the caller set.
+            # Reporting it as a success would make the limit advisory.
+            self._kills += 1
+            return TaskResult(
+                index,
+                None,
+                Status.TIMEOUT,
+                f"exceeded {self._timeout:g}s",
+                partial=progress,
+                elapsed_s=elapsed,
+            )
         if kind == "ok":
             return TaskResult(index, body, Status.OK, elapsed_s=elapsed)
         return TaskResult(index, None, Status.ERROR, str(body), elapsed_s=elapsed)
