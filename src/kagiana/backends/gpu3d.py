@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from ..features import load_feature_factory
-from ..geometry import best_assignment_rmsd, centroid_in_conformer
+from ..geometry import best_assignment_rmsd
 from ..molecules import mol_from_smiles
 from ..pharmacophore3d import make_pharmacophore, read_feature_points
 from ..progress import note, progress_bar
@@ -61,29 +61,56 @@ def _embed_ensemble(
     optimize_confs(mols, hardwareOptions=hardware)
 
 
-def _feature_atoms_by_family(
-    bare: Any, feature_factory: Any, query_types: list[str]
-) -> dict[str, list[tuple[int, ...]]] | None:
-    """Which atoms make up each candidate feature, per family.
+def _posed_copy(bare: Any) -> Any:
+    """A copy of the hydrogen-free molecule with one conformer to write into."""
+    from rdkit import Chem
 
-    Features are identified on the molecule *without* explicit hydrogens,
-    because that is the molecule the constrained pass asks about and a feature
-    definition can be sensitive to them: a carbon that is one-connected on its
-    own is four-connected once its hydrogens are drawn in. Locating those same
-    atoms in a conformer then gives candidates both stages agree on.
+    posed = Chem.Mol(bare)
+    posed.RemoveAllConformers()
+    conformer = Chem.Conformer(posed.GetNumAtoms())
+    posed.AddConformer(conformer, assignId=True)
+    return posed
+
+
+def _copy_positions(source: Any, destination: Any, n_atoms: int) -> None:
+    """Copy the heavy atoms' coordinates from one conformer into another.
+
+    Adding hydrogens appends them, so the heavy atoms keep their indices and
+    the two molecules can share coordinates by index.
+    """
+    target = destination.GetConformer()
+    for index in range(n_atoms):
+        target.SetAtomPosition(index, source.GetAtomPosition(index))
+
+
+def _candidates_by_family(
+    posed: Any, feature_factory: Any, query_types: list[str]
+) -> list[list[np.ndarray]] | None:
+    """Where each required family sits, as RDKit computes a feature's position.
+
+    Features are identified and placed on the molecule *without* explicit
+    hydrogens, which is the molecule the constrained pass asks about: a feature
+    definition can be sensitive to them, and a definition's weights decide
+    where a multi-atom feature's point lies. Averaging its atoms instead would
+    move the point — RDKit's zinc binder, weighted ``1,0``, sits on the sulfur
+    rather than between sulfur and carbon.
 
     Returns ``None`` when a required family has no candidate at all, which is
     not something to decide here.
     """
     wanted = set(query_types)
-    grouped: dict[str, list[tuple[int, ...]]] = {family: [] for family in wanted}
-    for feature in feature_factory.GetFeaturesForMol(bare):
+    grouped: dict[str, list[np.ndarray]] = {family: [] for family in wanted}
+    for feature in feature_factory.GetFeaturesForMol(posed):
         family = feature.GetFamily()
-        if family in wanted:
-            grouped[family].append(tuple(feature.GetAtomIds()))
+        if family not in wanted:
+            continue
+        position = feature.GetPos()
+        grouped[family].append(
+            np.array([position.x, position.y, position.z], dtype=float)
+        )
     if any(not grouped[family] for family in wanted):
         return None
-    return grouped
+    return [grouped[family] for family in query_types]
 
 
 def _best_rmsd_for_mol(
@@ -96,26 +123,26 @@ def _best_rmsd_for_mol(
     """Best fit of any conformer of a molecule onto the query points.
 
     ``mol`` carries the conformers and ``bare`` is the same molecule without
-    explicit hydrogens; the features come from ``bare`` and their positions
-    from ``mol``.
+    explicit hydrogens; each conformer's heavy-atom coordinates are copied onto
+    ``bare`` so that the features are both identified and placed the way the
+    constrained pass would.
 
     Returns the smallest RMSD found and whether every conformer was searched
     exhaustively.  A molecule with no conformers, or one that does not offer
     every required family, comes back as infinity; the caller sends those to
     the constrained pass rather than deciding them here.
     """
-    grouped = _feature_atoms_by_family(bare, feature_factory, query_types)
-    if grouped is None:
-        return float("inf"), True
+    n_atoms = bare.GetNumAtoms()
+    posed = _posed_copy(bare)
 
     best = float("inf")
     exhaustive = True
     measured = False
     for conformer in mol.GetConformers():
-        candidates = [
-            [centroid_in_conformer(conformer, atom_ids) for atom_ids in grouped[family]]
-            for family in query_types
-        ]
+        _copy_positions(conformer, posed, n_atoms)
+        candidates = _candidates_by_family(posed, feature_factory, query_types)
+        if candidates is None:
+            return float("inf"), True
         rmsd, complete = best_assignment_rmsd(query_coords, candidates)
         exhaustive = exhaustive and complete
         measured = True

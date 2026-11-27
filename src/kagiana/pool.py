@@ -39,7 +39,7 @@ _BUSY = "busy"
 
 # Set inside a worker process while a task is running, so that a task can
 # report partial progress the parent can still use if the worker is killed.
-_CURRENT: dict[str, Any] = {"conn": None, "index": -1, "started": 0.0}
+_CURRENT: dict[str, Any] = {"conn": None, "index": -1}
 
 
 def report_progress(value: Any) -> None:
@@ -54,11 +54,12 @@ def report_progress(value: Any) -> None:
     if conn is None:
         return
     try:
-        # The worker's own elapsed time travels with the report. The parent
-        # cannot infer it: by the time a report is read, the deadline may have
-        # passed for reasons that have nothing to do with the work.
-        elapsed = monotonic() - float(_CURRENT["started"])
-        conn.send(("progress", (_CURRENT["index"], elapsed, value)))
+        # The moment of the report travels with it, on the same system-wide
+        # monotonic clock the parent used to set the deadline. Neither an
+        # elapsed time nor the parent's reading time would do: the first
+        # ignores how long the worker waited before starting, the second
+        # charges the work for a parent that was slow to read.
+        conn.send(("progress", (_CURRENT["index"], monotonic(), value)))
     except (OSError, BrokenPipeError, ValueError):
         pass
 
@@ -115,20 +116,18 @@ def _worker_loop(
         if message is None:
             return
         index, payload = message
-        started = monotonic()
         _CURRENT["conn"] = conn
         _CURRENT["index"] = index
-        _CURRENT["started"] = started
         try:
             try:
                 value = task(payload)
             except BaseException as exc:  # noqa: BLE001 - one bad molecule must not stop the run
                 message_out = (
                     "error",
-                    (index, f"{type(exc).__name__}: {exc}", monotonic() - started),
+                    (index, f"{type(exc).__name__}: {exc}", monotonic()),
                 )
             else:
-                message_out = ("ok", (index, value, monotonic() - started))
+                message_out = ("ok", (index, value, monotonic()))
             try:
                 conn.send(message_out)
             except (OSError, BrokenPipeError, ValueError):
@@ -378,17 +377,23 @@ class KillableWorkerPool:
             slot.state = _IDLE
             return None
         if kind == "progress":
-            progress_index, elapsed, value = payload
-            # Progress the worker reported after its deadline is work the
+            progress_index, reported_at, value = payload
+            # Progress the worker reported after the deadline is work the
             # caller said it did not want, so it must not reach the result.
-            within_deadline = self._timeout is None or elapsed <= self._timeout
+            # The comparison is against the same deadline the parent set.
+            within_deadline = self._timeout is None or reported_at <= slot.deadline
             if progress_index == slot.index and within_deadline:
                 slot.progress = value
             return None
 
-        index, body, duration = payload
-        elapsed = float(duration)
-        overran = self._timeout is not None and elapsed > self._timeout
+        index, body, finished_at = payload
+        # The work is judged against the deadline the parent set when it was
+        # dispatched, using the moment the worker finished. That holds the task
+        # to the limit the caller asked for whether the delay was in the work
+        # itself, in the worker starting up, or in the parent reading the
+        # result.
+        elapsed = max(0.0, float(finished_at) - slot.dispatched_at)
+        overran = self._timeout is not None and float(finished_at) > slot.deadline
         progress = slot.progress
         slot.state = _IDLE
         slot.index = -1

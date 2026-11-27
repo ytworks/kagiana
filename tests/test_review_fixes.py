@@ -826,3 +826,171 @@ def test_a_column_name_containing_a_newline_survives_aggregation(
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
     assert len(records) - 1 == summary["n_screened"] == 2
     assert "vendor\nnote" in records[0]
+
+
+# --- fourth review round ---------------------------------------------------
+
+
+def test_a_task_is_held_to_the_deadline_set_when_it_was_dispatched() -> None:
+    """Whatever the delay, the limit is the one the caller asked for.
+
+    A worker that only begins work after the deadline has gone by must not be
+    reported as a success just because the parent read its result late, and
+    progress it reported after the deadline must not reach the row.
+    """
+    import time
+
+    from kagiana.pool import KillableWorkerPool
+
+    from .helpers import init_late_then_report, init_quick
+
+    with KillableWorkerPool(1, init_late_then_report, timeout=0.05) as pool:
+        results = pool.map_ordered(["C"])
+        time.sleep(0.4)
+        late = next(results)
+    assert late.status == Status.TIMEOUT
+    assert late.partial is None
+
+    with KillableWorkerPool(1, init_quick, timeout=0.05) as pool:
+        results = pool.map_ordered(["C"])
+        time.sleep(0.4)
+        prompt = next(results)
+    # Finished at once; a slow reader must not turn that into a timeout.
+    assert prompt.status == Status.OK
+
+
+def test_a_colliding_state_directory_is_reported_not_deleted(
+    tmp_path: Path, library: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    """The state directory's name comes from --out, so it can collide."""
+    from kagiana.runstate import RunState, generation_key, state_directory
+
+    out = tmp_path / "data.csv"
+    theirs = state_directory(out)
+    theirs.mkdir()
+    keepsake = theirs / "important.txt"
+    keepsake.write_text("keep me", encoding="utf-8")
+
+    with pytest.raises(Exception) as caught:
+        RunState.open(out, generation_key(mode="test"), resume=True)
+    assert "not created by this tool" in str(caught.value)
+    assert keepsake.read_text(encoding="utf-8") == "keep me"
+
+    # The screening command reports it as an input problem rather than crashing.
+    assert main(
+        ["pharm3d", "--library", str(library), "--pharmacophore", str(pharmacophore),
+         "--fdef", str(fdef), "--out", str(out), "--quiet"]
+    ) == EXIT_INPUT_ERROR
+    assert keepsake.read_text(encoding="utf-8") == "keep me"
+
+
+def test_pharm2d_resume_does_not_reuse_another_librarys_results(
+    tmp_path: Path, query: Path, fdef: Path, params: Path
+) -> None:
+    old = _write(tmp_path / "old.csv", "old0,NCCc1ccc(O)cc1", "old1,NCCc1ccc(OC)cc1")
+    new = _write(tmp_path / "new.csv", "new0,CC(=O)Oc1ccccc1C(=O)O", "new1,C")
+    out = tmp_path / "r.csv"
+    base = ["--query", str(query), "--fdef", str(fdef), "--params", str(params),
+            "--quiet"]
+
+    assert main(["pharm2d", "--library", str(old), *base, "--out", str(out)]) == EXIT_OK
+    assert set(pd.read_csv(out)["ID"]) == {"old0", "old1"}
+
+    assert main(
+        ["pharm2d", "--library", str(new), *base, "--out", str(out), "--resume"]
+    ) == EXIT_OK
+    assert list(pd.read_csv(csv_io.all_rows_path(out))["ID"]) == ["new0", "new1"]
+    survivors = pd.read_csv(out)
+    if len(survivors):
+        assert not set(survivors["ID"]) & {"old0", "old1"}
+
+
+def test_pharm2d_resume_republishes_diagnostics_and_counts(
+    tmp_path: Path, query: Path, fdef: Path, params: Path
+) -> None:
+    library = _write(
+        tmp_path / "lib.csv", "1,not-a-smiles", "2,also-broken", "3,NCCc1ccc(O)cc1"
+    )
+    out = tmp_path / "r.csv"
+    argv = ["pharm2d", "--library", str(library), "--query", str(query),
+            "--fdef", str(fdef), "--params", str(params), "--out", str(out), "--quiet"]
+    assert main(argv) == EXIT_OK
+
+    # Stand in for a crash after the results were replaced but before the log
+    # was published.
+    (tmp_path / "r_errors.jsonl").unlink()
+    summary_path = tmp_path / "s.json"
+    assert main([*argv, "--resume", "--json-summary", str(summary_path)]) == EXIT_OK
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["n_total"] == 3
+    assert summary["n_parse_error"] == 2
+    assert (tmp_path / "r_errors.jsonl").is_file()
+
+
+@pytest.mark.parametrize(
+    "field", ["prefilter_rmsd", "prefilter_conformers", "backend"]
+)
+def test_settings_that_change_a_row_change_the_resume_key(field: str) -> None:
+    """Resuming must not reuse results the current settings would not produce."""
+    from kagiana.runstate import generation_key
+
+    settings: dict[str, Any] = {
+        "mode": "pharm3d",
+        "backend": "gpu",
+        "library": Path("tests/data/library.csv"),
+        "pharmacophore": Path("tests/data/pharmacophore.csv"),
+        "fdef": Path("tests/data/test.fdef"),
+        "large": False,
+        "chunksize": None,
+        "conformers": 10,
+        "max_poses": 20,
+        "limit_upper": 1.5,
+        "limit_lower": 0.5,
+        "timeout": 10.0,
+        "prefilter_rmsd": 0.0,
+        "prefilter_conformers": 20,
+    }
+    baseline = generation_key(**settings)
+    assert generation_key(**settings) == baseline
+
+    changed = dict(settings)
+    changed[field] = {"prefilter_rmsd": 100.0, "prefilter_conformers": 50, "backend": "cpu"}[field]
+    assert generation_key(**changed) != baseline
+
+
+def test_the_fit_respects_the_weights_in_a_feature_definition() -> None:
+    """A feature's point is where its definition puts it, not its atoms' mean.
+
+    RDKit's zinc binder is weighted 1,0 and sits on the sulfur; averaging the
+    sulfur and the carbon moves the point and rejects a perfect match.
+    """
+    import os
+
+    import numpy as np
+    from rdkit import Chem, RDConfig
+    from rdkit.Chem import AllChem
+
+    from kagiana.backends import gpu3d
+    from kagiana.features import load_feature_factory
+
+    factory = load_feature_factory(os.path.join(RDConfig.RDDataDir, "BaseFeatures.fdef"))
+    bare = Chem.MolFromSmiles("SCc1ccccc1")
+    mol = Chem.AddHs(bare)
+    AllChem.EmbedMultipleConfs(mol, numConfs=1, randomSeed=7)
+
+    # Take the query from this very conformer, so a perfect fit exists.
+    posed = gpu3d._posed_copy(bare)
+    gpu3d._copy_positions(mol.GetConformer(), posed, bare.GetNumAtoms())
+    points: dict[str, Any] = {}
+    for feature in factory.GetFeaturesForMol(posed):
+        if feature.GetFamily() in ("ZnBinder", "Aromatic"):
+            points.setdefault(feature.GetFamily(), feature.GetPos())
+    assert set(points) == {"ZnBinder", "Aromatic"}
+
+    types = list(points)
+    coords = np.array([[points[t].x, points[t].y, points[t].z] for t in types])
+    best, exhaustive = gpu3d._best_rmsd_for_mol(mol, bare, factory, types, coords)
+    assert exhaustive is True
+    # Averaging the atoms gave 0.308, which a 0.1 threshold discards.
+    assert best < 0.01

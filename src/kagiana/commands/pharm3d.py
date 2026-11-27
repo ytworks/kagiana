@@ -90,6 +90,11 @@ def run(args: argparse.Namespace) -> RunSummary:
     # results came from anything else starts over rather than mixing the two.
     key = generation_key(
         mode="pharm3d",
+        # The backend that will actually run, not the one that was asked for:
+        # the prefilter settings below only bear on results it produced.
+        backend=backend,
+        prefilter_rmsd=args.prefilter_rmsd,
+        prefilter_conformers=args.prefilter_conformers,
         library=Path(args.library),
         pharmacophore=Path(args.pharmacophore),
         fdef=Path(args.fdef),

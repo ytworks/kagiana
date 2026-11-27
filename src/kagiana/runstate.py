@@ -21,12 +21,18 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .schema import InputError
+
 _STATE_FILE = "state.json"
+#: Written when the directory is created, and required before anything in it is
+#: removed.  The directory's name is derived from the output path, so it can
+#: collide with a directory of the caller's own, and deleting that would be
+#: unforgivable.
+_MARKER_FILE = ".kagiana-run-state"
 _VERSION = 1
 
 
@@ -88,10 +94,12 @@ class RunState:
         this run is about to replace.
         """
         directory = state_directory(out_path)
+        cls._require_ours(directory)
         stored = cls._read(directory)
         if not resume or stored is None or stored.get("key") != key:
             cls._discard(directory)
             directory.mkdir(parents=True, exist_ok=True)
+            (directory / _MARKER_FILE).write_text("", encoding="utf-8")
             state = cls(directory=directory, key=key)
             state._write()
             return state
@@ -100,6 +108,28 @@ class RunState:
             key=key,
             completed={int(index) for index in stored.get("completed", [])},
             finalized=bool(stored.get("finalized", False)),
+        )
+
+    @staticmethod
+    def _require_ours(directory: Path) -> None:
+        """Refuse to touch a directory this tool cannot show it created."""
+        if not directory.exists():
+            return
+        if not directory.is_dir():
+            raise InputError(
+                f"{directory} exists and is not a directory; this path is where "
+                f"the run keeps what it has finished, so move it aside or "
+                f"choose another --out"
+            )
+        if (directory / _MARKER_FILE).is_file():
+            return
+        if not any(directory.iterdir()):
+            # An empty directory holds nothing to lose.
+            return
+        raise InputError(
+            f"{directory} already exists and was not created by this tool; it "
+            f"is where the run would keep what it has finished. Move it aside "
+            f"or choose another --out."
         )
 
     @staticmethod
@@ -117,8 +147,15 @@ class RunState:
 
     @staticmethod
     def _discard(directory: Path) -> None:
-        if directory.exists():
-            shutil.rmtree(directory, ignore_errors=True)
+        """Remove only what this tool put in the directory."""
+        if not directory.is_dir():
+            return
+        (directory / _STATE_FILE).unlink(missing_ok=True)
+        (directory / f"{_STATE_FILE}.part").unlink(missing_ok=True)
+        for path in directory.glob("errors_*.jsonl"):
+            path.unlink(missing_ok=True)
+        for path in directory.glob("errors_*.jsonl.part"):
+            path.unlink(missing_ok=True)
 
     def _write(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)

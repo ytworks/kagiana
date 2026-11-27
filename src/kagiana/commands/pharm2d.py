@@ -77,14 +77,6 @@ def run(args: argparse.Namespace) -> RunSummary:
     all_rows_target = csv_io.all_rows_path(args.out)
     write_all_rows = not args.no_all_rows
 
-    if args.resume and Path(args.out).is_file():
-        message = f"resume: {args.out} already exists, nothing to do"
-        summary.notes.append(message)
-        note(message, args.quiet)
-        summary.outputs.append(str(args.out))
-        summary.elapsed_s = monotonic() - started
-        return summary
-
     screened_frames: list[pd.DataFrame] = []
     wrote_all_rows_header = False
     state = RunState.open(
@@ -105,6 +97,37 @@ def run(args: argparse.Namespace) -> RunSummary:
         resume=args.resume,
     )
     error_log = ErrorLog(args.out, state)
+
+    # Skip the run only when this generation recorded it as finished and the
+    # outputs it owes are there. The output file existing is not enough: it may
+    # hold the results of a different library screened into the same place.
+    required = [Path(args.out)] + ([all_rows_target] if write_all_rows else [])
+    if (
+        args.resume
+        and state.finalized
+        and all(target.is_file() for target in required)
+    ):
+        message = f"resume: {args.out} is already complete, nothing to do"
+        summary.notes.append(message)
+        note(message, args.quiet)
+        summary.outputs.extend(str(target) for target in required)
+        summary.n_screened = csv_io.count_records(args.out)
+        if write_all_rows:
+            summary.n_total = csv_io.count_records(all_rows_target)
+            for status, count in csv_io.read_status_counts(all_rows_target).items():
+                for _ in range(count):
+                    summary.count_status(status)
+        else:
+            summary.notes.append(
+                "resume: the per-row statuses are not available because the run "
+                "was asked not to keep every row"
+            )
+        # Diagnostics collected before the interruption are published here too,
+        # or a finished run would leave its reasons unreadable.
+        if error_log.publish():
+            summary.outputs.append(str(error_log.path))
+        summary.elapsed_s = monotonic() - started
+        return summary
 
     for chunk_index, frame in csv_io.read_chunks(args.library, params.chunksize):
         summary.n_chunks += 1

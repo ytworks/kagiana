@@ -10,7 +10,7 @@ expensive pass.
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Sequence
+from typing import Iterator, Sequence
 
 import numpy as np
 
@@ -169,20 +169,3 @@ def best_assignment_rmsd(
     # A search that hit either ceiling has not ruled anything out.
     exhausted = count >= budget or _LAST_SEARCH["visited"] >= node_budget
     return best, not exhausted
-
-
-def centroid_in_conformer(
-    conformer: Any, atom_ids: Sequence[int]
-) -> np.ndarray:
-    """Where a feature sits in a conformer, given the atoms that make it up.
-
-    A feature can span several atoms (a ring, a lumped hydrophobe), and its
-    position is their centre.  Taking the atoms rather than asking RDKit for a
-    feature's own position is what allows a feature to be identified on one
-    representation of a molecule and located on another.
-    """
-    total = np.zeros(3, dtype=float)
-    for atom_id in atom_ids:
-        position = conformer.GetAtomPosition(int(atom_id))
-        total += (position.x, position.y, position.z)
-    return total / max(1, len(atom_ids))
