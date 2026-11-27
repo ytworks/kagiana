@@ -112,7 +112,17 @@ def run(args: argparse.Namespace) -> RunSummary:
         summary.notes.append(message)
         note(message, args.quiet)
         summary.outputs.extend(str(target) for target in required)
-        _restore_summary(summary, state.summary)
+        if state.summary:
+            _restore_summary(summary, state.summary)
+        elif write_all_rows:
+            # A record written before the tallies were stored with it.
+            _recount_from_results(summary, args.out, all_rows_target)
+            state.mark_finalized(_summary_tallies(summary))
+        else:
+            summary.notes.append(
+                "resume: this run was recorded before its tallies were, and "
+                "without the per-row file they cannot be recovered"
+            )
         # Diagnostics collected before the interruption are published here too,
         # or a finished run would leave its reasons unreadable.
         if error_log.publish():
@@ -240,6 +250,18 @@ def _restore_summary(summary: RunSummary, stored: dict[str, Any]) -> None:
         value = stored.get(name)
         if isinstance(value, int):
             setattr(summary, name, value)
+
+
+def _recount_from_results(
+    summary: RunSummary, out_path: str, all_rows_path: Path
+) -> None:
+    """Rebuild the tallies of a finished run from the files it wrote."""
+    summary.n_screened = csv_io.count_records(out_path)
+    summary.n_total = csv_io.count_records(all_rows_path)
+    for status, count in csv_io.read_status_counts(all_rows_path).items():
+        for _ in range(count):
+            summary.count_status(status)
+    summary.n_chunks = 1 if summary.n_total else 0
 
 
 def _row_from_result(result: Any) -> dict[str, Any]:

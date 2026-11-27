@@ -728,14 +728,22 @@ def test_progress_reported_after_the_deadline_is_not_counted(
     """A timed-out row reports the work done inside the deadline, no more.
 
     The worker keeps generating poses until it is killed, and the parent may
-    read its reports much later; neither may inflate the count.
+    read its reports much later; neither may inflate the count. The bound is
+    what could have been reported within the deadline: with 10 ms, at most the
+    report made before the first assignment, which credits one pose for the
+    assignment it interrupted. Before progress reports carried a time, a run
+    whose result was read 300 ms late came back with 199.
+
+    Comparing two runs' counts to each other would be a race rather than a
+    test, since whether any report lands inside 10 ms depends on the machine.
+    The rule itself is pinned by
+    :func:`test_progress_from_after_the_deadline_does_not_reach_the_row`.
     """
     import time
 
     from kagiana.backends.cpu3d import init_worker
     from kagiana.pool import KillableWorkerPool
 
-    counts = []
     for stall in (0.0, 0.3):
         with KillableWorkerPool(
             1, init_worker, (str(fdef), str(pharmacophore), 1.5, 0.5, 200, 20),
@@ -745,10 +753,8 @@ def test_progress_reported_after_the_deadline_is_not_counted(
                 if stall:
                     time.sleep(stall)
                 assert result.status == Status.TIMEOUT
-                counts.append(result.partial.num_match() if result.partial else 0)
-
-    # A slow reader must not change what the row says.
-    assert counts[0] == counts[1]
+                counted = result.partial.num_match() if result.partial else 0
+                assert counted <= 1, f"stall={stall} reported {counted} poses"
 
 
 def test_the_fit_uses_the_features_a_cpu_run_would_see(
@@ -1181,3 +1187,89 @@ def test_resume_repeats_the_chunk_count_in_the_default_mode(
     second = json.loads(second_path.read_text(encoding="utf-8"))
     assert second["n_chunks"] == first["n_chunks"] == 1
     assert second["n_total"] == first["n_total"]
+
+
+# --- sixth review round ----------------------------------------------------
+
+
+def test_another_application_state_file_is_not_adopted(tmp_path: Path) -> None:
+    """`version: 1` is a thing many programs write.
+
+    The directory's name comes from --out, so a collision can be with another
+    tool's own record; adopting it on the version alone overwrote it.
+    """
+    from kagiana.runstate import RunState, generation_key, state_directory
+    from kagiana.schema import InputError
+
+    out = tmp_path / "other.csv"
+    directory = state_directory(out)
+    directory.mkdir()
+    theirs = {"version": 1, "application": "inventory", "cursor": 17}
+    state_file = directory / "state.json"
+    state_file.write_text(json.dumps(theirs), encoding="utf-8")
+
+    with pytest.raises(InputError, match="not created by this tool"):
+        RunState.open(out, generation_key(mode="test"), resume=True)
+    assert json.loads(state_file.read_text(encoding="utf-8")) == theirs
+    assert not (directory / ".kagiana-run-state").exists()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        {"version": 1, "key": "not-a-key", "completed": [], "finalized": False},
+        {"version": 1, "key": "0" * 32, "completed": "all", "finalized": False},
+        {"version": 1, "key": "0" * 32, "completed": [0], "finalized": "yes"},
+        {"version": 1, "key": "0" * 32, "completed": [-1], "finalized": False},
+        {"version": 1, "key": "0" * 32, "completed": [0], "finalized": False, "summary": []},
+    ],
+)
+def test_a_state_file_of_the_wrong_shape_is_not_ours(
+    tmp_path: Path, stored: dict[str, Any]
+) -> None:
+    from kagiana.runstate import RunState, generation_key, state_directory
+    from kagiana.schema import InputError
+
+    out = tmp_path / "r.csv"
+    directory = state_directory(out)
+    directory.mkdir()
+    (directory / "state.json").write_text(json.dumps(stored), encoding="utf-8")
+    with pytest.raises(InputError):
+        RunState.open(out, generation_key(mode="test"), resume=True)
+
+
+def test_a_record_without_tallies_recovers_them_from_the_results(
+    tmp_path: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    """Earlier versions recorded a finished run without its counts.
+
+    Reporting such a run as having screened nothing would be worse than
+    re-reading the files it wrote, which still hold the answer.
+    """
+    library = _write(tmp_path / "lib.csv", "1,NCCc1ccc(O)cc1", "2,not-a-smiles")
+    out = tmp_path / "r.csv"
+    argv = ["pharm3d", "--library", str(library),
+            "--pharmacophore", str(pharmacophore), "--fdef", str(fdef),
+            "--out", str(out), "--quiet"]
+
+    first_path = tmp_path / "first.json"
+    assert main([*argv, "--json-summary", str(first_path)]) == EXIT_OK
+    first = json.loads(first_path.read_text(encoding="utf-8"))
+    assert first["n_parse_error"] == 1
+
+    # Strip the tallies, leaving the record as an earlier version wrote it.
+    from kagiana.runstate import state_directory
+
+    state_file = state_directory(out) / "state.json"
+    stored = json.loads(state_file.read_text(encoding="utf-8"))
+    del stored["summary"]
+    state_file.write_text(json.dumps(stored), encoding="utf-8")
+
+    second_path = tmp_path / "second.json"
+    assert main([*argv, "--resume", "--json-summary", str(second_path)]) == EXIT_OK
+    second = json.loads(second_path.read_text(encoding="utf-8"))
+    for field in ("n_total", "n_screened", "n_parse_error", "n_chunks"):
+        assert second[field] == first[field], field
+
+    # Recovered once, then stored, so the next resume needs no re-reading.
+    assert json.loads(state_file.read_text(encoding="utf-8"))["summary"]

@@ -38,6 +38,9 @@ _VERSION = 1
 #: The only diagnostic files this tool creates in the directory.  Removing
 #: anything else would mean deleting a file the caller put there.
 _OWNED = re.compile(r"^errors_\d+\.jsonl(\.part)?$")
+#: What :func:`generation_key` produces, and the only thing a state file of
+#: this tool's own may hold as its key.
+_KEY = re.compile(r"^[0-9a-f]{32}$")
 
 
 def state_directory(out_path: str | Path) -> Path:
@@ -147,6 +150,14 @@ class RunState:
 
     @staticmethod
     def _read(directory: Path) -> dict[str, Any] | None:
+        """This tool's own state file, or ``None`` for anything else.
+
+        The check is strict on purpose.  ``version: 1`` is a thing many
+        programs write, and a loose check meant adopting another application's
+        state file and overwriting it.  So every field this tool writes has to
+        be present and of the right type, and the key has to look like one
+        :func:`generation_key` produced.
+        """
         path = directory / _STATE_FILE
         if not path.is_file():
             return None
@@ -155,6 +166,20 @@ class RunState:
         except (json.JSONDecodeError, OSError):
             return None
         if not isinstance(data, dict) or data.get("version") != _VERSION:
+            return None
+        if not isinstance(data.get("key"), str) or not _KEY.match(data["key"]):
+            return None
+        completed = data.get("completed")
+        if not isinstance(completed, list) or not all(
+            isinstance(index, int) and not isinstance(index, bool) and index >= 0
+            for index in completed
+        ):
+            return None
+        if not isinstance(data.get("finalized"), bool):
+            return None
+        # `summary` was added later, so a state file without it is still ours.
+        summary = data.get("summary", {})
+        if not isinstance(summary, dict):
             return None
         return data
 

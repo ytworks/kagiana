@@ -121,7 +121,14 @@ def run(args: argparse.Namespace) -> RunSummary:
         summary.notes.append(message)
         note(message, args.quiet)
         summary.outputs.extend(str(target) for target in whole_file_outputs)
-        _restore_summary(summary, state.summary)
+        if state.summary:
+            _restore_summary(summary, state.summary)
+        else:
+            # A record written before the tallies were stored with it. They are
+            # recoverable from the results themselves, so recover them rather
+            # than reporting a finished run as having screened nothing.
+            _recount_from_results(summary, Path(args.out))
+            state.mark_finalized(_summary_tallies(summary))
         # Diagnostics recorded before the interruption are published here too,
         # or a finished run would leave its reasons unreadable.
         if error_log.publish():
@@ -246,6 +253,17 @@ def _restore_summary(summary: RunSummary, stored: dict[str, Any]) -> None:
         value = stored.get(name)
         if isinstance(value, int):
             setattr(summary, name, value)
+
+
+def _recount_from_results(summary: RunSummary, out_path: Path) -> None:
+    """Rebuild the tallies of a whole-file run from the files it wrote."""
+    summary.n_total = csv_io.count_records(out_path)
+    summary.n_screened = csv_io.count_records(csv_io.screened_path(out_path))
+    for status, count in csv_io.read_status_counts(out_path).items():
+        for _ in range(count):
+            summary.count_status(status)
+    # Whole-file mode is one chunk by definition.
+    summary.n_chunks = 1 if summary.n_total or out_path.is_file() else 0
 
 
 def _combine_hits(hit_files: list[Path], target: Path) -> None:
