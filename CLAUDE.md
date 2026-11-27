@@ -64,8 +64,9 @@ in the chemistry.
    that is reproducible by the command beside it. The scaling table is one measurement on one
    machine and says so. Do not fill a gap with an estimate.
 
-8. **Say what is unverified.** The GPU path has never run: no CUDA here, and nvMolKit ships
-   x86_64 Linux wheels only. The READMEs carry a verification-status section, and it stays honest.
+8. **Say what is unverified.** The GPU path has now been run on a Blackwell card and agrees with
+   the CPU backend, but only on ten molecules, and `pytest -m gpu` has still not run anywhere. The
+   READMEs carry a verification-status section, and it stays honest about which of those is which.
    Tests that need a device are marked `gpu` and skip themselves.
 
 9. **Both READMEs change together.** `scripts/check_readme_pair.py` compares the heading outline,

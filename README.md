@@ -13,8 +13,8 @@ Give it a CSV with a SMILES column and it appends score columns, leaving every o
 as it found it. Screening runs across CPU cores, no single molecule can stall a run, and a CUDA
 path is available for the heavy parts.
 
-> **Status: version 0.1, in development.** The CPU paths are tested and were run on real data. The
-> GPU paths are written but have never executed; see [Verification status](#verification-status).
+> **Status: version 0.1, in development.** Both the CPU and the GPU paths have been run; see
+> [Verification status](#verification-status) for what was measured on which hardware.
 
 - [Features](#features)
 - [How it works](#how-it-works)
@@ -352,6 +352,11 @@ place, so a file under its final name is complete.
 The CUDA path uses [nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit). It pins the RDKit
 version it was built against.
 
+Verified on an NVIDIA RTX PRO 6000 Blackwell (compute capability 12.0) with nvMolKit 0.7.0 and
+torch 2.11.0+cu128: the 2D scores match the CPU backend exactly, and the 3D path finds the same
+hits. The GPU is slower on a ten-molecule library, where CUDA start-up dominates; it is meant for
+libraries large enough for that to disappear.
+
 `--backend auto` uses the GPU when one is usable and falls back to the CPU with a note on stderr
 otherwise. `--backend gpu` fails with exit code 2 instead of falling back, because nvMolKit has no
 CPU fallback of its own and a run that asked for a device should not quietly become a CPU run.
@@ -409,19 +414,34 @@ commands in code blocks, the links and the numbers in tables, and CI runs it.
 
 ## Verification status
 
-The CPU paths are covered by the test suite and were exercised on real inputs, including inside the
-CPU container image.
+The CPU paths are covered by the test suite, run in CI on Ubuntu and macOS for Python 3.11 to 3.13,
+and were exercised on real inputs, including inside the CPU container image.
 
-**The GPU paths have never been run.** They were developed on macOS arm64, which cannot host CUDA,
-and nvMolKit publishes x86_64 Linux wheels only. The dependency resolution for `linux/amd64` was
-checked and the CUDA base image tag was confirmed to exist, but neither the GPU image build nor
-`--backend gpu` itself has been executed. To verify on suitable hardware:
+The GPU paths have now been run, on one NVIDIA RTX PRO 6000 Blackwell (compute capability 12.0,
+driver 595.99.02) with nvMolKit 0.7.0, torch 2.11.0+cu128 and RDKit 2026.03.6. The GPU image built
+and `backends` reported the device, which also answers whether nvMolKit's published wheels work on
+a GPU generation newer than the CUDA they were built with: they do.
+
+| Check | Result |
+| --- | --- |
+| 2D scores against the CPU backend | Identical; largest difference 0 |
+| 3D hits against the CPU backend | The same four molecules |
+| 3D `match` and `numMatch` per row | Identical on every row |
+| Hits lost to the prefilter | 0 |
+
+The prefilter settled only the unparsable row, before any conformer was generated, and deferred
+every molecule it could not measure — which is the invariant it is built to.
+
+Reproduce with:
 
 ```bash
-docker build --platform linux/amd64 -f docker/Dockerfile.gpu -t kagiana:gpu .
-docker run --rm --gpus all kagiana:gpu backends --json
+docker build -f docker/Dockerfile.gpu -t kagiana:gpu .
+docker run --rm --gpus "device=0" kagiana:gpu backends --json
 uv run pytest -m gpu
 ```
+
+Still unmeasured: how the GPU path behaves on a library large enough for the device to pay for
+itself. The runs above were ten molecules, where CUDA start-up is the whole cost.
 
 ## License
 

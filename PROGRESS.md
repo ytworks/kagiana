@@ -4,7 +4,8 @@ Cross-session memory for kagiana: what exists, what is measured, what is not don
 pick up next. Read this first, then `CLAUDE.md`.
 
 Last updated: 2026-11-28. Branch `feat/pharmacophore-screening-cli`, draft PR #1.
-126 tests pass locally; 3 skip without a CUDA device.
+140 tests pass locally and in CI on Ubuntu and macOS for Python 3.11 to 3.13; 3 skip without a
+CUDA device. The GPU path has now been run on real hardware.
 
 ## State
 
@@ -18,10 +19,10 @@ subcommands.
 | CPU parallelism | Works and measured. Worker processes, results in input order |
 | Timeouts | Works. Worker killed on its deadline; verified on real data (Suramin at 10 s) |
 | `--resume` | Works. Driven by a recorded generation key, not by file existence |
-| GPU 2D | Written, never run. Fingerprints stay on the CPU; the similarity matrix goes to the device |
-| GPU 3D | Written, never run. Conformer ensemble as a prefilter, survivors to the CPU pass |
+| GPU 2D | Run. Scores identical to the CPU backend, largest difference 0 |
+| GPU 3D | Run. Same hits as the CPU backend; `match` and `numMatch` identical on every row |
 | Docker CPU | Built and run, including inside the container |
-| Docker GPU | Written, never built |
+| Docker GPU | Built and run on a Blackwell card |
 
 ## What is measured
 
@@ -36,6 +37,21 @@ Seconds. Reproduce with `kagiana pharm3d --library <50k rows> --large --chunksiz
 
 Peak resident memory in `--large` mode follows the chunk width, not the hit count: 100 MB at
 `--chunksize 2000` and 122 MB at `--chunksize 25000`, for a library with 14,539 hits.
+
+On one NVIDIA RTX PRO 6000 Blackwell (compute capability 12.0, driver 595.99.02), with nvMolKit
+0.7.0, torch 2.11.0+cu128 and RDKit 2026.03.6, through `docker/Dockerfile.gpu`:
+
+| Check | Result |
+|---|---|
+| `backends` reports the device | Yes — the published wheels work on a GPU newer than their CUDA |
+| 2D scores against the CPU backend | Identical, largest difference 0 |
+| 3D hits against the CPU backend | The same four molecules |
+| 3D `match` and `numMatch` per row | Identical on every row |
+| Hits lost to the prefilter | 0; it settled only the unparsable row |
+
+Wall time on ten molecules was 0.1 s on the CPU against 1.8 s (2D) and 2.1 s (3D) on the GPU: CUDA
+start-up is the whole cost at that size. How the GPU path behaves on a library large enough to pay
+for itself is still unmeasured.
 
 On the GPR17 antagonist set (44 molecules), 2D similarity to SAR-2 ranks all 12 selective
 meta-substituted compounds above every non-selective one; ROC AUC 0.931 for selective against
@@ -82,11 +98,12 @@ apart at all with those bins.
 
 ## What to pick up next
 
-1. **Run the GPU path.** It has never executed. Needs a Linux x86_64 host with an NVIDIA GPU
-   (compute capability 7.0+, driver 560.28+). The steps are in the READMEs' verification section;
-   `uv run pytest -m gpu` compares GPU scores against the CPU backend.
-2. **Build the GPU image.** `docker build --platform linux/amd64 -f docker/Dockerfile.gpu`.
-   Dependency resolution for that platform was checked (nvmolkit 0.7.0 pins `rdkit==2026.3.6`,
-   torch 2.15.0) but nothing was built.
-3. **Decide whether the 2D GPU path is worth keeping.** If fingerprint generation dominates at
-   realistic library sizes, the device buys little; that is a measurement, not a guess.
+1. **Measure the GPU path at a size where it could pay.** The agreement runs were ten molecules,
+   where CUDA start-up is the whole cost. The open question is the crossover: at what library size
+   does each mode beat the CPU, and for 2D whether fingerprint generation dominates so thoroughly
+   that the device never does. That decides whether the 2D GPU path is worth keeping.
+2. **Run `pytest -m gpu` on a device.** The three skipped tests have not run anywhere; the
+   agreement above was checked through the CLI instead.
+3. **Decide the GPU image's base.** It builds on `nvidia/cuda:12.9.1-runtime-ubuntu24.04` and
+   worked on a compute-capability 12.0 card, which is newer than the toolkit the wheels were built
+   with. That is worth a note if a newer nvMolKit changes its pinning.

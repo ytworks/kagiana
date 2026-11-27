@@ -13,8 +13,8 @@ SMILES の列を持つ CSV を渡すとスコア列を追記します。それ�
 スクリーニングは CPU のコアに分散し、1 分子が run 全体を止めることはなく、重い部分には CUDA 経路が
 あります。
 
-> **状態: バージョン 0.1、開発中。** CPU 経路はテスト済みで、実データでも動かしています。GPU 経路は
-> 実装済みですが一度も実行していません。[検証状況](#検証状況)を参照してください。
+> **状態: バージョン 0.1、開発中。** CPU 経路と GPU 経路のどちらも実行しています。どのハードウェアで
+> 何を測ったかは[検証状況](#検証状況)を参照してください。
 
 - [特長](#特長)
 - [仕組み](#仕組み)
@@ -343,6 +343,11 @@ kagiana validate  --library L.csv [--fdef F.fdef] [--pharmacophore P.csv]
 CUDA 経路は [nvMolKit](https://github.com/NVIDIA-BioNeMo/nvMolKit) を使います。nvMolKit はビルド
 時の RDKit バージョンを固定します。
 
+NVIDIA RTX PRO 6000 Blackwell（compute capability 12.0）で nvMolKit 0.7.0 と torch 2.11.0+cu128 を
+使って検証しました。2D のスコアは CPU バックエンドと厳密に一致し、3D も同じヒットを返します。10
+分子のライブラリでは CUDA の初期化が支配的なので GPU のほうが遅く、効くのはそれが埋もれるだけの
+規模のライブラリです。
+
 `--backend auto` は GPU が使えればそれを使い、使えなければ stderr に通知して CPU に落ちます。
 `--backend gpu` は落ちずに終了コード 2 で失敗します。nvMolKit 自体に CPU フォールバックがなく、
 デバイスを要求した run が黙って CPU の run に変わるべきではないからです。
@@ -397,18 +402,34 @@ python scripts/check_readme_pair.py
 
 ## 検証状況
 
-CPU 経路はテストで覆われており、実データでも、CPU のコンテナイメージの中でも動かしています。
+CPU 経路はテストで覆われ、CI では Ubuntu と macOS の Python 3.11 から 3.13 で動き、実データでも、
+CPU のコンテナイメージの中でも動かしています。
 
-**GPU 経路は一度も実行していません。** 開発環境が macOS arm64 で CUDA を載せられず、nvMolKit は
-x86_64 Linux の wheel しか公開していないためです。`linux/amd64` での依存解決と CUDA ベースイメージ
-のタグの存在は確認しましたが、GPU イメージのビルドも `--backend gpu` 自体も実行していません。
-適切なハードウェアでの検証手順は次のとおりです。
+GPU 経路も実行しました。NVIDIA RTX PRO 6000 Blackwell 1 枚（compute capability 12.0、ドライバ
+595.99.02）、nvMolKit 0.7.0、torch 2.11.0+cu128、RDKit 2026.03.6 です。GPU イメージはビルドでき、
+`backends` がデバイスを認識しました。これは「nvMolKit の公開 wheel がビルド時の CUDA より新しい
+世代の GPU で動くか」という疑問にも答えています。動きます。
+
+| 確認項目 | 結果 |
+| --- | --- |
+| 2D のスコアと CPU バックエンドの比較 | 一致。最大差 0 |
+| 3D のヒットと CPU バックエンドの比較 | 同じ 4 分子 |
+| 3D の行ごとの `match` と `numMatch` | 全行一致 |
+| プリフィルターで失われたヒット | 0 |
+
+プリフィルターが判定したのは解釈不能な 1 行だけで、しかも配座生成の前です。測れなかった分子はすべて
+繰り越しており、これはプリフィルターが満たすべき不変条件そのものです。
+
+再現手順は次のとおりです。
 
 ```bash
-docker build --platform linux/amd64 -f docker/Dockerfile.gpu -t kagiana:gpu .
-docker run --rm --gpus all kagiana:gpu backends --json
+docker build -f docker/Dockerfile.gpu -t kagiana:gpu .
+docker run --rm --gpus "device=0" kagiana:gpu backends --json
 uv run pytest -m gpu
 ```
+
+未測定のまま残っているのは、デバイスが元を取れる規模のライブラリで GPU 経路がどう振る舞うかです。
+上記の run は 10 分子で、CUDA の初期化がコストのすべてでした。
 
 ## ライセンス
 
