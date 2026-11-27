@@ -219,7 +219,11 @@ def _add_pharm3d(subparsers: argparse._SubParsersAction) -> None:
         "--timeout",
         type=float,
         default=DEFAULT_TIMEOUT,
-        help="seconds a single molecule may take before its worker is killed",
+        help=(
+            "seconds a single molecule may take in the constrained-embedding "
+            "stage before its worker is killed; the GPU prefilter runs as "
+            "batched device calls and is not covered by this limit"
+        ),
     )
     parser.add_argument(
         "--prefilter-rmsd",

@@ -203,7 +203,15 @@ converge cannot be stopped from inside the worker. Instead the parent tracks
 when each molecule was dispatched and **kills the worker outright** when
 `--timeout` passes, then starts a replacement. The run continues, and the row
 is marked `timeout`, keeping the poses already embedded plus one for the
-assignment that was interrupted.
+assignment that was interrupted. A molecule that finishes after its deadline is
+reported as a timeout too, rather than as a success that happened to be late.
+
+**What the limit covers.** `--timeout` applies to the constrained-embedding
+stage, which is where screening can fail to converge. The GPU prefilter is not
+covered: it generates conformers for a whole batch in one device call, and a
+per-molecule interruption point inside that call would mean giving up the
+batching that makes it worth using. A prefilter batch therefore runs to
+completion even under a short `--timeout`.
 
 ### Measured scaling
 
@@ -248,6 +256,14 @@ What each mode actually offloads:
   through the same constrained-embedding pass the CPU backend uses, so
   `match` and `numMatch` keep their meaning. `--prefilter-rmsd` controls how
   aggressive the first stage is — raise it if you suspect it is discarding hits.
+
+  The prefilter only ever removes work. It settles a molecule only when it
+  measured a fit for every query feature and that fit is clearly too far off;
+  such a row reports `match=True`, `numMatch=0` and
+  `stage=gpu_prefilter_reject`, because the molecule does carry the features
+  and it is the geometry that failed. Anything it could not measure — no usable
+  conformer, a missing feature family, or an assignment search that hit its
+  budget — is passed to the constrained stage rather than decided.
 
 ## Docker
 
