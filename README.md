@@ -258,6 +258,22 @@ docker compose -f docker/docker-compose.yml --profile cpu run --rm cpu backends
 docker compose -f docker/docker-compose.yml --profile gpu run --rm gpu backends
 ```
 
+## Troubleshooting
+
+**Many `pharm2d` rows come back as `error` with "distance bin not found".**
+This is a limitation of RDKit's 2D signature factory rather than a problem with
+the library. A feature-to-feature distance is measured between feature *atom
+sets*, which can produce distance triples that a triangle inequality forbids,
+and the factory prunes exactly those bin combinations when it is built. Widening
+the bins, reducing `n_maxpoint` to `2`, or skipping multi-atom feature families
+(aromatic rings, lumped hydrophobes) via `skip_feature` all reduce it. The run
+itself completes either way: the affected rows are flagged and explained in
+`<out>_errors.jsonl` rather than aborting the screen.
+
+**`--backend gpu` exits with code 2.** The GPU path is unavailable; run
+`kagiana backends --json` to see the reasons. Use `--backend auto` to screen on
+the CPU instead.
+
 ## Exit codes
 
 | Code | Meaning |

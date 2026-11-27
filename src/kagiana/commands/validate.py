@@ -31,8 +31,10 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
         report["errors"].append(message)
 
     try:
-        rows = csv_io.count_rows(args.library)
+        # read_chunks validates existence and the SMILES column first, so a
+        # missing file is reported as an input problem rather than raising.
         _, frame = next(csv_io.read_chunks(args.library, 1))
+        rows = csv_io.count_rows(args.library)
         record(
             "library",
             {
@@ -42,7 +44,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
                 "first_smiles": str(frame[SMILES_COLUMN].iloc[0]),
             },
         )
-    except (InputError, StopIteration) as exc:
+    except (InputError, StopIteration, OSError) as exc:
         fail("library", f"{exc}")
 
     families: list[str] = []

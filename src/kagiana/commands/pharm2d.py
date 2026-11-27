@@ -135,7 +135,7 @@ def run(args: argparse.Namespace) -> RunSummary:
     screened = (
         pd.concat(screened_frames, ignore_index=True)
         if screened_frames
-        else pd.DataFrame(columns=list(_expected_columns([])))
+        else pd.DataFrame()
     )
     error_log.close()
     summary.n_screened = len(screened)
@@ -151,10 +151,6 @@ def run(args: argparse.Namespace) -> RunSummary:
 
     summary.elapsed_s = monotonic() - started
     return summary
-
-
-def _expected_columns(base: Any) -> tuple[str, ...]:
-    return (*tuple(base), *SCORE_COLUMNS_2D, *DIAGNOSTIC_COLUMNS_2D)
 
 
 def _score_chunk_cpu(

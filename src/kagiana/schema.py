@@ -95,8 +95,10 @@ class RunSummary:
         return dataclasses.asdict(self)
 
     def write(self, path: str | Path) -> None:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
         text = json.dumps(self.to_dict(), indent=2, ensure_ascii=False)
-        Path(path).write_text(text + "\n", encoding="utf-8")
+        target.write_text(text + "\n", encoding="utf-8")
 
 
 def require_smiles_column(columns: Any, source: str) -> None:

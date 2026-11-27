@@ -97,6 +97,11 @@ def intersections_numpy(reference: np.ndarray, library: np.ndarray) -> np.ndarra
     return np.unpackbits(common, axis=1).sum(axis=1).astype(np.int64)
 
 
+#: Rows per popcount slice, so that device memory stays bounded no matter how
+#: many molecules a chunk holds.
+_POPCOUNT_SLICE = 65_536
+
+
 def _intersections_with_popcount(
     reference: np.ndarray, library: np.ndarray
 ) -> np.ndarray:
@@ -110,11 +115,15 @@ def _intersections_with_popcount(
         device=device,
     )
     reference_t = torch.from_numpy(reference).to(device)
-    library_t = torch.from_numpy(library).to(device)
-    common = torch.bitwise_and(library_t, reference_t)
-    counts = lookup[common.long()].sum(dim=1, dtype=torch.int64)
+
+    results: list[np.ndarray] = []
+    for start in range(0, len(library), _POPCOUNT_SLICE):
+        block = torch.from_numpy(library[start : start + _POPCOUNT_SLICE]).to(device)
+        common = torch.bitwise_and(block, reference_t)
+        counts = lookup[common.long()].sum(dim=1, dtype=torch.int64)
+        results.append(counts.cpu().numpy())
     torch.cuda.synchronize()
-    return counts.cpu().numpy()
+    return np.concatenate(results) if results else np.zeros(0, dtype=np.int64)
 
 
 def score_chunk(

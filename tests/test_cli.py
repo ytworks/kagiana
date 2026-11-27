@@ -34,22 +34,31 @@ def test_the_documented_3d_defaults_are_in_force() -> None:
     assert args.backend == "auto"
 
 
-def test_no_input_path_has_a_default() -> None:
+@pytest.mark.parametrize(
+    ("command", "complete"),
+    [
+        (
+            "pharm2d",
+            ["--library", "l.csv", "--query", "q.csv", "--fdef", "f.fdef",
+             "--out", "o.csv", "--params", "p.json"],
+        ),
+        (
+            "pharm3d",
+            ["--library", "l.csv", "--pharmacophore", "p.csv", "--fdef", "f.fdef",
+             "--out", "o.csv"],
+        ),
+    ],
+)
+def test_every_path_must_be_given(command: str, complete: list[str]) -> None:
+    """No input or output path may fall back to a built-in location."""
     parser = build_parser()
-    for command, required in (
-        ("pharm2d", ["--library", "--query", "--fdef", "--out", "--params"]),
-        ("pharm3d", ["--library", "--pharmacophore", "--fdef", "--out"]),
-    ):
+    parser.parse_args([command, *complete])
+
+    # Dropping any one of the required options must be rejected.
+    for position in range(0, len(complete), 2):
+        without = complete[:position] + complete[position + 2 :]
         with pytest.raises(SystemExit):
-            parser.parse_args([command])
-        # Every path is required, so none can silently point somewhere else.
-        actions = {
-            option
-            for action in parser._subparsers._group_actions[0].choices[command]._actions  # type: ignore[attr-defined]
-            for option in action.option_strings
-            if action.required
-        }
-        assert set(required) <= actions
+            parser.parse_args([command, *without])
 
 
 def test_backends_reports_this_machine(capsys: pytest.CaptureFixture[str]) -> None:
