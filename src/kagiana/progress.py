@@ -9,8 +9,9 @@ tool is driven by another program.
 from __future__ import annotations
 
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
-from typing import Any, Iterator
+from typing import Any
 
 
 def want_progress(quiet: bool) -> bool:

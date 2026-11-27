@@ -160,7 +160,7 @@ class ErrorLog:
     def close(self) -> int:
         return self.publish()
 
-    def __enter__(self) -> "ErrorLog":
+    def __enter__(self) -> ErrorLog:
         return self
 
     def __exit__(self, *_exc: Any) -> None:

@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,9 @@ _STATE_FILE = "state.json"
 #: unforgivable.
 _MARKER_FILE = ".kagiana-run-state"
 _VERSION = 1
+#: The only diagnostic files this tool creates in the directory.  Removing
+#: anything else would mean deleting a file the caller put there.
+_OWNED = re.compile(r"^errors_\d+\.jsonl(\.part)?$")
 
 
 def state_directory(out_path: str | Path) -> Path:
@@ -81,11 +85,12 @@ class RunState:
     key: str
     completed: set[int] = field(default_factory=set)
     finalized: bool = False
+    summary: dict[str, Any] = field(default_factory=dict)
 
     # -- lifecycle ---------------------------------------------------------
 
     @classmethod
-    def open(cls, out_path: str | Path, key: str, resume: bool) -> "RunState":
+    def open(cls, out_path: str | Path, key: str, resume: bool) -> RunState:
         """Load the record for this generation, or start a fresh one.
 
         A run that is not resuming starts over by definition, and so does one
@@ -103,15 +108,17 @@ class RunState:
             state = cls(directory=directory, key=key)
             state._write()
             return state
+        summary = stored.get("summary")
         return cls(
             directory=directory,
             key=key,
             completed={int(index) for index in stored.get("completed", [])},
             finalized=bool(stored.get("finalized", False)),
+            summary=dict(summary) if isinstance(summary, dict) else {},
         )
 
-    @staticmethod
-    def _require_ours(directory: Path) -> None:
+    @classmethod
+    def _require_ours(cls, directory: Path) -> None:
         """Refuse to touch a directory this tool cannot show it created."""
         if not directory.exists():
             return
@@ -125,6 +132,12 @@ class RunState:
             return
         if not any(directory.iterdir()):
             # An empty directory holds nothing to lose.
+            return
+        if cls._read(directory) is not None:
+            # A state file of this tool's own shape. Versions before the marker
+            # existed wrote one without it, and a run of theirs should be
+            # resumable rather than reported as somebody else's directory.
+            (directory / _MARKER_FILE).write_text("", encoding="utf-8")
             return
         raise InputError(
             f"{directory} already exists and was not created by this tool; it "
@@ -147,15 +160,20 @@ class RunState:
 
     @staticmethod
     def _discard(directory: Path) -> None:
-        """Remove only what this tool put in the directory."""
+        """Remove only the files this tool creates.
+
+        A caller may have left something of their own here — a note, a copy of
+        a log — and the names this tool generates are narrow enough to say so
+        exactly, so nothing else is touched.
+        """
         if not directory.is_dir():
             return
         (directory / _STATE_FILE).unlink(missing_ok=True)
         (directory / f"{_STATE_FILE}.part").unlink(missing_ok=True)
-        for path in directory.glob("errors_*.jsonl"):
-            path.unlink(missing_ok=True)
-        for path in directory.glob("errors_*.jsonl.part"):
-            path.unlink(missing_ok=True)
+        (directory / f"{Path(_STATE_FILE).stem}.json.part").unlink(missing_ok=True)
+        for path in directory.iterdir():
+            if path.is_file() and _OWNED.match(path.name):
+                path.unlink(missing_ok=True)
 
     def _write(self) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -164,6 +182,7 @@ class RunState:
             "key": self.key,
             "completed": sorted(self.completed),
             "finalized": self.finalized,
+            "summary": self.summary,
         }
         target = self.directory / _STATE_FILE
         temporary = target.with_suffix(".json.part")
@@ -187,9 +206,17 @@ class RunState:
         self.completed.add(chunk)
         self._write()
 
-    def mark_finalized(self) -> None:
-        """Record a whole-file run as finished, once both outputs are on disk."""
+    def mark_finalized(self, summary: dict[str, Any] | None = None) -> None:
+        """Record a run as finished, once the outputs it owes are on disk.
+
+        The tallies it reported are stored with it, so that resuming can repeat
+        them without re-reading result files — which may not all have been
+        written, and which a later run must not read from a different
+        generation anyway.
+        """
         self.finalized = True
+        if summary is not None:
+            self.summary = dict(summary)
         self._write()
 
     def chunk_error_path(self, chunk: int) -> Path:

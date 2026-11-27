@@ -25,12 +25,13 @@ from typing import Any
 import pandas as pd
 
 from .. import csv_io
-from ..errlog import ErrorLog
 from ..backends import GPU, resolve_backend
-from ..backends.cpu3d import Partial3D, init_worker as cpu_init_worker
+from ..backends.cpu3d import Partial3D
+from ..backends.cpu3d import init_worker as cpu_init_worker
+from ..errlog import ErrorLog
 from ..pool import KillableWorkerPool, default_jobs
-from ..runstate import RunState, generation_key
 from ..progress import note, progress_bar
+from ..runstate import RunState, generation_key
 from ..schema import (
     DIAGNOSTIC_COLUMNS_3D,
     SCORE_COLUMNS_3D,
@@ -120,11 +121,7 @@ def run(args: argparse.Namespace) -> RunSummary:
         summary.notes.append(message)
         note(message, args.quiet)
         summary.outputs.extend(str(target) for target in whole_file_outputs)
-        for status, count in csv_io.read_status_counts(args.out).items():
-            for _ in range(count):
-                summary.count_status(status)
-        summary.n_total = csv_io.count_records(args.out)
-        summary.n_screened = csv_io.count_records(csv_io.screened_path(args.out))
+        _restore_summary(summary, state.summary)
         # Diagnostics recorded before the interruption are published here too,
         # or a finished run would leave its reasons unreadable.
         if error_log.publish():
@@ -201,8 +198,6 @@ def run(args: argparse.Namespace) -> RunSummary:
         csv_io.write_frame(scored, chunk_target, index=True)
         csv_io.write_frame(hits, screened_target, index=True)
         state.mark_chunk_complete(chunk_index)
-        if not args.large:
-            state.mark_finalized()
         summary.outputs.extend([str(chunk_target), str(screened_target)])
         hit_total += len(hits)
         hit_files.append(screened_target)
@@ -222,8 +217,35 @@ def run(args: argparse.Namespace) -> RunSummary:
             f"{error_log.count} row(s) did not score cleanly; see {error_log.path}"
         )
 
+    # Recorded last: the run is finished once everything it owes is on disk,
+    # and the tallies travel with that record so a resume can repeat them.
+    state.mark_finalized(_summary_tallies(summary))
+
     summary.elapsed_s = monotonic() - started
     return summary
+
+
+#: The tallies a finished run records, so that resuming can repeat them.
+_TALLIES = (
+    "n_total",
+    "n_screened",
+    "n_timeout",
+    "n_parse_error",
+    "n_error",
+    "n_chunks",
+)
+
+
+def _summary_tallies(summary: RunSummary) -> dict[str, int]:
+    return {name: int(getattr(summary, name)) for name in _TALLIES}
+
+
+def _restore_summary(summary: RunSummary, stored: dict[str, Any]) -> None:
+    """Put back the counts a finished run reported."""
+    for name in _TALLIES:
+        value = stored.get(name)
+        if isinstance(value, int):
+            setattr(summary, name, value)
 
 
 def _combine_hits(hit_files: list[Path], target: Path) -> None:
@@ -270,34 +292,33 @@ def _screen_chunk(
     # Only molecules that survived the prefilter need the constrained-embedding
     # pass; the rest are already decided.
     todo = [i for i in range(len(smiles)) if i not in prefilter]
-    rows: list[dict[str, Any]] = [dict() for _ in smiles]
+    rows: list[dict[str, Any]] = [{} for _ in smiles]
     for index, decided in prefilter.items():
         rows[index] = decided
 
     if todo:
         label = f"pharm3d chunk {chunk_index}"
         stage = Stage.GPU_PREFILTER_PASS if backend == GPU else Stage.CPU
-        with progress_bar(len(todo), label, args.quiet) as bar:
-            with KillableWorkerPool(
-                n_workers=min(jobs, max(1, len(todo))),
-                initializer=cpu_init_worker,
-                initargs=(
-                    str(args.fdef),
-                    str(args.pharmacophore),
-                    args.limit_upper,
-                    args.limit_lower,
-                    args.conformers,
-                    args.max_poses,
-                ),
-                timeout=args.timeout,
-            ) as pool:
-                for result in pool.map_ordered([smiles[i] for i in todo]):
-                    position = todo[result.index]
-                    row = _row_from_result(result, stage)
-                    # Carry the prefilter's fit through to the surviving rows.
-                    row["best_rmsd"] = prefilter_rmsd.get(position, NAN)
-                    rows[position] = row
-                    bar.update(1)
+        with progress_bar(len(todo), label, args.quiet) as bar, KillableWorkerPool(
+            n_workers=min(jobs, max(1, len(todo))),
+            initializer=cpu_init_worker,
+            initargs=(
+                str(args.fdef),
+                str(args.pharmacophore),
+                args.limit_upper,
+                args.limit_lower,
+                args.conformers,
+                args.max_poses,
+            ),
+            timeout=args.timeout,
+        ) as pool:
+            for result in pool.map_ordered([smiles[i] for i in todo]):
+                position = todo[result.index]
+                row = _row_from_result(result, stage)
+                # Carry the prefilter's fit through to the surviving rows.
+                row["best_rmsd"] = prefilter_rmsd.get(position, NAN)
+                rows[position] = row
+                bar.update(1)
     return rows
 
 

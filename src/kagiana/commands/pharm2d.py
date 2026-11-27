@@ -16,11 +16,10 @@ from typing import Any
 import pandas as pd
 
 from .. import csv_io
-from ..errlog import ErrorLog
-from ..backends import CPU, GPU, resolve_backend
+from ..backends import GPU, resolve_backend
 from ..backends.cpu2d import init_worker as cpu_init_worker
+from ..errlog import ErrorLog
 from ..pool import KillableWorkerPool, default_jobs
-from ..runstate import RunState, generation_key
 from ..progress import note, progress_bar
 from ..query2d import (
     build_sig_factory,
@@ -28,6 +27,7 @@ from ..query2d import (
     read_reference_smiles,
     reference_fingerprint,
 )
+from ..runstate import RunState, generation_key
 from ..schema import (
     DIAGNOSTIC_COLUMNS_2D,
     SCORE_COLUMNS_2D,
@@ -88,6 +88,7 @@ def run(args: argparse.Namespace) -> RunSummary:
             fdef=Path(args.fdef),
             params=Path(args.params),
             chunksize=params.chunksize,
+            write_all_rows=not args.no_all_rows,
             cutoffs=(
                 params.tanimoto_cutoff,
                 params.dice_cutoff,
@@ -111,17 +112,7 @@ def run(args: argparse.Namespace) -> RunSummary:
         summary.notes.append(message)
         note(message, args.quiet)
         summary.outputs.extend(str(target) for target in required)
-        summary.n_screened = csv_io.count_records(args.out)
-        if write_all_rows:
-            summary.n_total = csv_io.count_records(all_rows_target)
-            for status, count in csv_io.read_status_counts(all_rows_target).items():
-                for _ in range(count):
-                    summary.count_status(status)
-        else:
-            summary.notes.append(
-                "resume: the per-row statuses are not available because the run "
-                "was asked not to keep every row"
-            )
+        _restore_summary(summary, state.summary)
         # Diagnostics collected before the interruption are published here too,
         # or a finished run would leave its reasons unreadable.
         if error_log.publish():
@@ -193,7 +184,7 @@ def run(args: argparse.Namespace) -> RunSummary:
     summary.outputs.append(str(args.out))
     if write_all_rows and wrote_all_rows_header:
         summary.outputs.append(str(all_rows_target))
-    state.mark_finalized()
+    state.mark_finalized(_summary_tallies(summary))
     if error_log.publish():
         summary.outputs.append(str(error_log.path))
         summary.notes.append(
@@ -216,17 +207,39 @@ def _score_chunk_cpu(
     """Fingerprint and score a chunk across worker processes."""
     rows: list[dict[str, Any]] = []
     label = f"pharm2d chunk {chunk_index}"
-    with progress_bar(len(smiles), label, quiet) as bar:
-        with KillableWorkerPool(
-            n_workers=min(jobs, max(1, len(smiles))),
-            initializer=cpu_init_worker,
-            initargs=(fdef_path, params, reference_smiles),
-            timeout=None,
-        ) as pool:
-            for result in pool.map_ordered(smiles):
-                rows.append(_row_from_result(result))
-                bar.update(1)
+    with progress_bar(len(smiles), label, quiet) as bar, KillableWorkerPool(
+        n_workers=min(jobs, max(1, len(smiles))),
+        initializer=cpu_init_worker,
+        initargs=(fdef_path, params, reference_smiles),
+        timeout=None,
+    ) as pool:
+        for result in pool.map_ordered(smiles):
+            rows.append(_row_from_result(result))
+            bar.update(1)
     return rows
+
+
+#: The tallies a finished run records, so that resuming can repeat them.
+_TALLIES = (
+    "n_total",
+    "n_screened",
+    "n_timeout",
+    "n_parse_error",
+    "n_error",
+    "n_chunks",
+)
+
+
+def _summary_tallies(summary: RunSummary) -> dict[str, int]:
+    return {name: int(getattr(summary, name)) for name in _TALLIES}
+
+
+def _restore_summary(summary: RunSummary, stored: dict[str, Any]) -> None:
+    """Put back the counts a finished run reported."""
+    for name in _TALLIES:
+        value = stored.get(name)
+        if isinstance(value, int):
+            setattr(summary, name, value)
 
 
 def _row_from_result(result: Any) -> dict[str, Any]:

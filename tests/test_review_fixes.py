@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -18,6 +19,7 @@ from kagiana.cli import EXIT_INPUT_ERROR, EXIT_OK, main
 from kagiana.molecules import mol_from_smiles
 from kagiana.schema import Status
 
+from .helpers import init_quick
 
 # --- library cells are passed through as written ---------------------------
 
@@ -831,18 +833,97 @@ def test_a_column_name_containing_a_newline_survives_aggregation(
 # --- fourth review round ---------------------------------------------------
 
 
-def test_a_task_is_held_to_the_deadline_set_when_it_was_dispatched() -> None:
-    """Whatever the delay, the limit is the one the caller asked for.
+def test_the_deadline_is_judged_on_the_moment_the_work_finished() -> None:
+    """The rule itself, independent of how a delay came about.
 
-    A worker that only begins work after the deadline has gone by must not be
-    reported as a success just because the parent read its result late, and
-    progress it reported after the deadline must not reach the row.
+    A worker can be slow to pick up its task as well as slow to do it, and the
+    parent can be slow to read the answer. Only one of those is the task
+    overrunning, so the verdict comes from the time the worker reports against
+    the deadline the parent set — not from an elapsed time, which misses the
+    wait before the work began, and not from the parent's clock when it reads.
     """
+    from kagiana.pool import _IDLE, KillableWorkerPool, _Slot
+
+    pool = KillableWorkerPool(1, init_quick, timeout=0.05)
+    dispatched_at = 100.0
+
+    def slot_at(finished_at: float) -> tuple[_Slot, object]:
+        class _Pipe:
+            """Hands over one already-sent message and nothing more."""
+
+            def __init__(self, message: object) -> None:
+                self._message = message
+
+            def recv(self) -> object:
+                return self._message
+
+        slot = _Slot(
+            conn=_Pipe(("ok", (0, "value", finished_at))),  # type: ignore[arg-type]
+            process=None,
+            state="busy",
+            index=0,
+            deadline=dispatched_at + 0.05,
+        )
+        slot.dispatched_at = dispatched_at
+        return slot, slot.conn
+
+    # Finished inside the deadline: a success, whenever it is read.
+    slot, _ = slot_at(dispatched_at + 0.01)
+    pool._slots = [slot]
+    in_time = pool._receive(0, slot)
+    assert in_time is not None
+    assert in_time.status == Status.OK
+    assert in_time.value == "value"
+
+    # Began late and so finished past the deadline: a timeout, even though the
+    # work itself took no time at all.
+    slot, _ = slot_at(dispatched_at + 0.14)
+    pool._slots = [slot]
+    overran = pool._receive(0, slot)
+    assert overran is not None
+    assert overran.status == Status.TIMEOUT
+    assert overran.value is None
+    assert slot.state == _IDLE
+
+
+def test_progress_from_after_the_deadline_does_not_reach_the_row() -> None:
+    """Same rule for a partial count: the report carries when it was made."""
+    from kagiana.pool import KillableWorkerPool, _Slot
+
+    pool = KillableWorkerPool(1, init_quick, timeout=0.05)
+    dispatched_at = 100.0
+
+    class _Pipe:
+        def __init__(self, message: object) -> None:
+            self._message = message
+
+        def recv(self) -> object:
+            return self._message
+
+    def deliver(reported_at: float, value: str) -> _Slot:
+        slot = _Slot(
+            conn=_Pipe(("progress", (0, reported_at, value))),  # type: ignore[arg-type]
+            process=None,
+            state="busy",
+            index=0,
+            deadline=dispatched_at + 0.05,
+        )
+        slot.dispatched_at = dispatched_at
+        pool._slots = [slot]
+        assert pool._receive(0, slot) is None
+        return slot
+
+    assert deliver(dispatched_at + 0.01, "in time").progress == "in time"
+    assert deliver(dispatched_at + 0.14, "too late").progress is None
+
+
+def test_a_task_that_finished_in_time_survives_a_slow_consumer_end_to_end() -> None:
+    """The same two cases through real worker processes."""
     import time
 
     from kagiana.pool import KillableWorkerPool
 
-    from .helpers import init_late_then_report, init_quick
+    from .helpers import init_late_then_report
 
     with KillableWorkerPool(1, init_late_then_report, timeout=0.05) as pool:
         results = pool.map_ordered(["C"])
@@ -855,7 +936,6 @@ def test_a_task_is_held_to_the_deadline_set_when_it_was_dispatched() -> None:
         results = pool.map_ordered(["C"])
         time.sleep(0.4)
         prompt = next(results)
-    # Finished at once; a slow reader must not turn that into a timeout.
     assert prompt.status == Status.OK
 
 
@@ -994,3 +1074,110 @@ def test_the_fit_respects_the_weights_in_a_feature_definition() -> None:
     assert exhaustive is True
     # Averaging the atoms gave 0.308, which a 0.1 threshold discards.
     assert best < 0.01
+
+
+# --- fifth review round ----------------------------------------------------
+
+
+def test_a_state_directory_from_an_earlier_version_is_adopted(
+    tmp_path: Path, library: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    """Versions before the ownership marker wrote none; their runs still resume."""
+    from kagiana.runstate import RunState, generation_key, state_directory
+
+    out = tmp_path / "r.csv"
+    directory = state_directory(out)
+    directory.mkdir()
+    key = generation_key(mode="test")
+    (directory / "state.json").write_text(
+        json.dumps({"version": 1, "key": key, "completed": [0, 1], "finalized": True}),
+        encoding="utf-8",
+    )
+
+    state = RunState.open(out, key, resume=True)
+    assert state.completed == {0, 1}
+    assert state.finalized is True
+
+
+def test_only_the_files_this_tool_creates_are_removed(tmp_path: Path) -> None:
+    """A caller may keep something of their own in the state directory."""
+    from kagiana.runstate import RunState, generation_key, state_directory
+
+    out = tmp_path / "r.csv"
+    directory = state_directory(out)
+    directory.mkdir()
+    (directory / ".kagiana-run-state").write_text("", encoding="utf-8")
+    mine = directory / "errors_manual.jsonl"
+    mine.write_text("mine", encoding="utf-8")
+    ours = directory / "errors_0.jsonl"
+    ours.write_text("ours", encoding="utf-8")
+
+    # A fresh generation clears what this tool wrote, and nothing else.
+    RunState.open(out, generation_key(mode="fresh"), resume=False)
+    assert mine.read_text(encoding="utf-8") == "mine"
+    assert not ours.exists()
+
+
+def test_dropping_no_all_rows_does_not_adopt_an_older_full_file(
+    tmp_path: Path, query: Path, fdef: Path, params: Path
+) -> None:
+    """Which outputs a run owes is part of what makes a run the same run."""
+    old = _write(tmp_path / "old.csv", "old0,not-a-smiles", "old1,also-broken")
+    new = _write(tmp_path / "new.csv", "new0,NCCc1ccc(O)cc1")
+    out = tmp_path / "r.csv"
+    base = ["pharm2d", "--query", str(query), "--fdef", str(fdef),
+            "--params", str(params), "--out", str(out), "--quiet"]
+
+    assert main([*base, "--library", str(old)]) == EXIT_OK
+    assert list(pd.read_csv(csv_io.all_rows_path(out))["ID"]) == ["old0", "old1"]
+
+    # The new library is screened without the full-row file, then resumed with
+    # it: the older file must not be passed off as this run's.
+    assert main([*base, "--library", str(new), "--no-all-rows"]) == EXIT_OK
+    assert main([*base, "--library", str(new), "--resume"]) == EXIT_OK
+    assert list(pd.read_csv(csv_io.all_rows_path(out))["ID"]) == ["new0"]
+
+
+def test_resume_repeats_the_counts_without_the_full_row_file(
+    tmp_path: Path, query: Path, fdef: Path, params: Path
+) -> None:
+    """The tallies come from what the run recorded, not from re-reading files.
+
+    With --no-all-rows there is no file to re-read, and even with one the chunk
+    count is not recoverable from it.
+    """
+    library = _write(tmp_path / "lib.csv", "1,NCCc1ccc(O)cc1", "2,not-a-smiles")
+    out = tmp_path / "r.csv"
+    argv = ["pharm2d", "--library", str(library), "--query", str(query),
+            "--fdef", str(fdef), "--params", str(params), "--out", str(out),
+            "--no-all-rows", "--quiet"]
+
+    first_path = tmp_path / "first.json"
+    assert main([*argv, "--json-summary", str(first_path)]) == EXIT_OK
+    second_path = tmp_path / "second.json"
+    assert main([*argv, "--resume", "--json-summary", str(second_path)]) == EXIT_OK
+
+    first = json.loads(first_path.read_text(encoding="utf-8"))
+    second = json.loads(second_path.read_text(encoding="utf-8"))
+    for field in ("n_total", "n_screened", "n_parse_error", "n_error", "n_chunks"):
+        assert second[field] == first[field], field
+
+
+def test_resume_repeats_the_chunk_count_in_the_default_mode(
+    tmp_path: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    library = _write(tmp_path / "lib.csv", "1,NCCc1ccc(O)cc1", "2,c1ccccc1")
+    out = tmp_path / "r.csv"
+    argv = ["pharm3d", "--library", str(library),
+            "--pharmacophore", str(pharmacophore), "--fdef", str(fdef),
+            "--out", str(out), "--quiet"]
+
+    first_path = tmp_path / "first.json"
+    assert main([*argv, "--json-summary", str(first_path)]) == EXIT_OK
+    second_path = tmp_path / "second.json"
+    assert main([*argv, "--resume", "--json-summary", str(second_path)]) == EXIT_OK
+
+    first = json.loads(first_path.read_text(encoding="utf-8"))
+    second = json.loads(second_path.read_text(encoding="utf-8"))
+    assert second["n_chunks"] == first["n_chunks"] == 1
+    assert second["n_total"] == first["n_total"]

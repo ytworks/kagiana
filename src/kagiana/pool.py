@@ -20,10 +20,12 @@ from __future__ import annotations
 import multiprocessing as mp
 import os
 import platform
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import suppress
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
 from time import monotonic
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from typing import Any
 
 from .schema import Status
 
@@ -53,15 +55,13 @@ def report_progress(value: Any) -> None:
     conn = _CURRENT.get("conn")
     if conn is None:
         return
-    try:
+    with suppress(OSError, BrokenPipeError, ValueError):
         # The moment of the report travels with it, on the same system-wide
         # monotonic clock the parent used to set the deadline. Neither an
         # elapsed time nor the parent's reading time would do: the first
         # ignores how long the worker waited before starting, the second
         # charges the work for a parent that was slow to read.
         conn.send(("progress", (_CURRENT["index"], monotonic(), value)))
-    except (OSError, BrokenPipeError, ValueError):
-        pass
 
 
 class WorkerInitError(RuntimeError):
@@ -191,7 +191,7 @@ class KillableWorkerPool:
 
     # -- lifecycle ---------------------------------------------------------
 
-    def __enter__(self) -> "KillableWorkerPool":
+    def __enter__(self) -> KillableWorkerPool:
         self._slots = [self._spawn() for _ in range(self._n_workers)]
         return self
 
@@ -212,10 +212,8 @@ class KillableWorkerPool:
         return _Slot(conn=parent_conn, process=process)
 
     def _replace(self, slot: _Slot, init_failures: int = 0) -> _Slot:
-        try:
+        with suppress(OSError):
             slot.conn.close()
-        except OSError:
-            pass
         if slot.process.is_alive():
             slot.process.kill()
         slot.process.join(timeout=5)
@@ -235,10 +233,8 @@ class KillableWorkerPool:
             if slot.process.is_alive():
                 slot.process.kill()
                 slot.process.join(timeout=2)
-            try:
+            with suppress(OSError):
                 slot.conn.close()
-            except OSError:
-                pass
         self._slots = []
 
     @property
@@ -364,7 +360,7 @@ class KillableWorkerPool:
                     "a worker process exited before it finished starting up "
                     f"(exit code {exit_code}) after "
                     f"{slot.init_failures + 1} attempts"
-                )
+                ) from None
             self._slots[position] = self._replace(slot, slot.init_failures + 1)
             return None
 

@@ -12,8 +12,9 @@ accounts for the work already done plus the assignment that was interrupted.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any
 
 from rdkit import RDLogger
 from rdkit.Chem import AllChem, rdDistGeom

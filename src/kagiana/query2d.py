@@ -45,7 +45,7 @@ class Params2D:
         simpson_cutoff: float | None = None,
         dice_cutoff: float | None = None,
         chunksize: int | None = None,
-    ) -> "Params2D":
+    ) -> Params2D:
         changes: dict[str, Any] = {}
         if tanimoto_cutoff is not None:
             changes["tanimoto_cutoff"] = float(tanimoto_cutoff)

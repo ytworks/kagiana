@@ -13,7 +13,8 @@ from a popcount on the GPU.  Both are exact.
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
@@ -140,44 +141,43 @@ def score_chunk(
     reference_count = reference_fp.GetNumOnBits()
     n_bits = reference_fp.GetNumBits()
 
-    rows: list[dict[str, Any]] = [dict() for _ in smiles]
+    rows: list[dict[str, Any]] = [{} for _ in smiles]
     on_bits: list[tuple[int, ...]] = []
     scored_positions: list[int] = []
 
-    with progress_bar(len(smiles), "pharm2d fingerprints", quiet) as bar:
-        with KillableWorkerPool(
-            n_workers=min(jobs, max(1, len(smiles))),
-            initializer=init_worker,
-            initargs=(fdef_path, params, reference_smiles),
-            timeout=None,
-        ) as pool:
-            for result in pool.map_ordered(smiles):
-                position = result.index
-                if result.status != Status.OK or result.value is None:
-                    status = (
-                        Status.PARSE_ERROR
-                        if result.status == Status.OK
-                        else result.status
-                    )
-                    detail = (
-                        "RDKit could not parse the SMILES string"
-                        if result.status == Status.OK
-                        else result.detail
-                    )
-                    rows[position] = {
-                        "tanimoto": NAN,
-                        "dice": NAN,
-                        "simpson": NAN,
-                        "status": status,
-                        "elapsed_s": result.elapsed_s,
-                        "_detail": detail,
-                    }
-                else:
-                    bits, _width = result.value
-                    on_bits.append(bits)
-                    scored_positions.append(position)
-                    rows[position] = {"elapsed_s": result.elapsed_s}
-                bar.update(1)
+    with progress_bar(len(smiles), "pharm2d fingerprints", quiet) as bar, KillableWorkerPool(
+        n_workers=min(jobs, max(1, len(smiles))),
+        initializer=init_worker,
+        initargs=(fdef_path, params, reference_smiles),
+        timeout=None,
+    ) as pool:
+        for result in pool.map_ordered(smiles):
+            position = result.index
+            if result.status != Status.OK or result.value is None:
+                status = (
+                    Status.PARSE_ERROR
+                    if result.status == Status.OK
+                    else result.status
+                )
+                detail = (
+                    "RDKit could not parse the SMILES string"
+                    if result.status == Status.OK
+                    else result.detail
+                )
+                rows[position] = {
+                    "tanimoto": NAN,
+                    "dice": NAN,
+                    "simpson": NAN,
+                    "status": status,
+                    "elapsed_s": result.elapsed_s,
+                    "_detail": detail,
+                }
+            else:
+                bits, _width = result.value
+                on_bits.append(bits)
+                scored_positions.append(position)
+                rows[position] = {"elapsed_s": result.elapsed_s}
+            bar.update(1)
 
     if not scored_positions:
         return rows

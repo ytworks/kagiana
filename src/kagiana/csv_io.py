@@ -25,8 +25,9 @@ from __future__ import annotations
 import csv
 import os
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pandas as pd
 
@@ -140,8 +141,7 @@ def iter_records(csv_path: str | Path) -> Iterator[tuple[int, list[str]]]:
     file would call the row, and the header is returned as record 0.
     """
     with open(csv_path, newline="", encoding="utf-8-sig") as handle:
-        for number, fields in enumerate(csv.reader(handle)):
-            yield number, fields
+        yield from enumerate(csv.reader(handle))
 
 
 def write_frame(frame: pd.DataFrame, path: str | Path, index: bool) -> Path:

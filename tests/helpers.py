@@ -6,7 +6,7 @@ from, so these cannot be defined inside a test function.
 
 from __future__ import annotations
 
-from typing import Callable
+from collections.abc import Callable
 
 
 def init_instant() -> Callable[[int], int]:
