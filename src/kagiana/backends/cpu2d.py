@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from rdkit import RDLogger
+
 from ..query2d import Params2D, build_sig_factory, fingerprint, reference_fingerprint
 
 
@@ -55,6 +57,9 @@ def init_worker(
     fdef_path: str, params: Params2D, reference_smiles: str
 ) -> Callable[[str], Score2D | None]:
     """Build the per-worker state and return the task callable."""
+    # Unparsable SMILES are expected in a screening library and are reported
+    # per row, so RDKit's own complaints would only be noise on stderr.
+    RDLogger.DisableLog("rdApp.*")
     sig_factory = build_sig_factory(fdef_path, params)
     reference_fp = reference_fingerprint(reference_smiles, sig_factory)
 

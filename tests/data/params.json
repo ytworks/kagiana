@@ -1,0 +1,9 @@
+{
+  "n_maxpoint": 3,
+  "bins": [[0, 2], [2, 5], [5, 8]],
+  "skip_feature": ["NegIonizable"],
+  "chunksize": 4,
+  "tanimoto_cutoff": 0.3,
+  "simpson_cutoff": 0.3,
+  "dice_cutoff": 0.3
+}

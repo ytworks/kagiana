@@ -123,6 +123,7 @@ class _Slot:
     deadline: float = 0.0
     init_failures: int = 0
     progress: Any = None
+    dispatched_at: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -134,6 +135,7 @@ class TaskResult:
     status: str
     detail: str = ""
     partial: Any = None
+    elapsed_s: float = 0.0
 
 
 class KillableWorkerPool:
@@ -261,6 +263,7 @@ class KillableWorkerPool:
                 slot.state = _BUSY
                 slot.index = index
                 slot.progress = None
+                slot.dispatched_at = monotonic()
                 slot.deadline = (
                     monotonic() + self._timeout if self._timeout else float("inf")
                 )
@@ -306,6 +309,7 @@ class KillableWorkerPool:
                     Status.ERROR,
                     "worker process died",
                     partial=slot.progress,
+                    elapsed_s=monotonic() - slot.dispatched_at,
                 )
                 self._slots[position] = self._replace(slot)
                 return failed
@@ -327,11 +331,12 @@ class KillableWorkerPool:
             return None
 
         index, body = payload
+        elapsed = monotonic() - slot.dispatched_at
         slot.state = _IDLE
         slot.index = -1
         if kind == "ok":
-            return TaskResult(index, body, Status.OK)
-        return TaskResult(index, None, Status.ERROR, str(body))
+            return TaskResult(index, body, Status.OK, elapsed_s=elapsed)
+        return TaskResult(index, None, Status.ERROR, str(body), elapsed_s=elapsed)
 
     def _enforce_deadlines(self, buffered: dict[int, TaskResult]) -> None:
         if not self._timeout:
@@ -346,6 +351,7 @@ class KillableWorkerPool:
                 Status.TIMEOUT,
                 f"exceeded {self._timeout:g}s",
                 partial=slot.progress,
+                elapsed_s=now - slot.dispatched_at,
             )
             self._kills += 1
             self._slots[position] = self._replace(slot)
