@@ -173,8 +173,14 @@ it goes, so an interrupted run leaves usable partial results:
 | `<out>_screened_<i>.csv` | The hits of chunk `i` |
 | `<out>_screened_all.csv` | Every hit of the run |
 
-`--resume` skips work whose outputs already exist: individual chunks in
-`--large` mode, the whole run otherwise.
+`--resume` skips only the work *this* combination of inputs and settings
+recorded as finished. Output files on their own cannot say which run produced
+them, so a run keeps a small record in a hidden `.<out>_state/` directory
+beside its results: the inputs it ran on, the chunks it completed, and the
+diagnostics of each. Screening a different library into the same output
+directory therefore starts over instead of inheriting half of the earlier
+results, and a chunk counts as finished only once its diagnostics and both of
+its CSVs are on disk.
 
 ## Defaults
 

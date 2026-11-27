@@ -82,10 +82,11 @@ def test_the_source_molecule_fits_its_own_query(
 ) -> None:
     """The query was derived from this molecule, so a conformer should fit it."""
     types, coords = _query(pharmacophore)
-    mol = Chem.AddHs(Chem.MolFromSmiles("NCCc1ccc(O)cc1"))
+    bare = Chem.MolFromSmiles("NCCc1ccc(O)cc1")
+    mol = Chem.AddHs(bare)
     AllChem.EmbedMultipleConfs(mol, numConfs=20, randomSeed=0xC0FFEE)
     best, exhaustive = gpu3d._best_rmsd_for_mol(
-        mol, load_feature_factory(fdef), types, coords
+        mol, bare, load_feature_factory(fdef), types, coords
     )
     assert exhaustive is True
     assert np.isfinite(best)
@@ -96,10 +97,11 @@ def test_a_molecule_without_the_families_cannot_be_measured(
     fdef: Path, pharmacophore: Path
 ) -> None:
     types, coords = _query(pharmacophore)
-    mol = Chem.AddHs(Chem.MolFromSmiles("c1ccccc1"))
+    bare = Chem.MolFromSmiles("c1ccccc1")
+    mol = Chem.AddHs(bare)
     AllChem.EmbedMultipleConfs(mol, numConfs=5, randomSeed=0xC0FFEE)
     best, exhaustive = gpu3d._best_rmsd_for_mol(
-        mol, load_feature_factory(fdef), types, coords
+        mol, bare, load_feature_factory(fdef), types, coords
     )
     assert best == float("inf")
     assert exhaustive is True
@@ -110,10 +112,11 @@ def test_a_molecule_with_no_conformers_cannot_be_measured(
 ) -> None:
     """An empty ensemble rules nothing out and must not look like a miss."""
     types, coords = _query(pharmacophore)
-    mol = Chem.AddHs(Chem.MolFromSmiles("NCCc1ccc(O)cc1"))
+    bare = Chem.MolFromSmiles("NCCc1ccc(O)cc1")
+    mol = Chem.AddHs(bare)
     assert mol.GetNumConformers() == 0
     best, _exhaustive = gpu3d._best_rmsd_for_mol(
-        mol, load_feature_factory(fdef), types, coords
+        mol, bare, load_feature_factory(fdef), types, coords
     )
     assert best == float("inf")
 
@@ -125,9 +128,10 @@ def test_more_conformers_cannot_make_the_fit_worse(
     factory = load_feature_factory(fdef)
 
     def best_with(n_confs: int) -> float:
-        mol = Chem.AddHs(Chem.MolFromSmiles("NCCc1ccc(OC)cc1"))
+        bare = Chem.MolFromSmiles("NCCc1ccc(OC)cc1")
+        mol = Chem.AddHs(bare)
         AllChem.EmbedMultipleConfs(mol, numConfs=n_confs, randomSeed=0xC0FFEE)
-        return gpu3d._best_rmsd_for_mol(mol, factory, types, coords)[0]
+        return gpu3d._best_rmsd_for_mol(mol, bare, factory, types, coords)[0]
 
     assert best_with(10) <= best_with(2) + 1e-9
 

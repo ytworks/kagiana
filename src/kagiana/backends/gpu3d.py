@@ -20,7 +20,7 @@ from typing import Any
 import numpy as np
 
 from ..features import load_feature_factory
-from ..geometry import best_assignment_rmsd, group_positions_by_family
+from ..geometry import best_assignment_rmsd, centroid_in_conformer
 from ..molecules import mol_from_smiles
 from ..pharmacophore3d import make_pharmacophore, read_feature_points
 from ..progress import note, progress_bar
@@ -61,29 +61,61 @@ def _embed_ensemble(
     optimize_confs(mols, hardwareOptions=hardware)
 
 
+def _feature_atoms_by_family(
+    bare: Any, feature_factory: Any, query_types: list[str]
+) -> dict[str, list[tuple[int, ...]]] | None:
+    """Which atoms make up each candidate feature, per family.
+
+    Features are identified on the molecule *without* explicit hydrogens,
+    because that is the molecule the constrained pass asks about and a feature
+    definition can be sensitive to them: a carbon that is one-connected on its
+    own is four-connected once its hydrogens are drawn in. Locating those same
+    atoms in a conformer then gives candidates both stages agree on.
+
+    Returns ``None`` when a required family has no candidate at all, which is
+    not something to decide here.
+    """
+    wanted = set(query_types)
+    grouped: dict[str, list[tuple[int, ...]]] = {family: [] for family in wanted}
+    for feature in feature_factory.GetFeaturesForMol(bare):
+        family = feature.GetFamily()
+        if family in wanted:
+            grouped[family].append(tuple(feature.GetAtomIds()))
+    if any(not grouped[family] for family in wanted):
+        return None
+    return grouped
+
+
 def _best_rmsd_for_mol(
     mol: Any,
+    bare: Any,
     feature_factory: Any,
     query_types: list[str],
     query_coords: np.ndarray,
 ) -> tuple[float, bool]:
     """Best fit of any conformer of a molecule onto the query points.
 
+    ``mol`` carries the conformers and ``bare`` is the same molecule without
+    explicit hydrogens; the features come from ``bare`` and their positions
+    from ``mol``.
+
     Returns the smallest RMSD found and whether every conformer was searched
-    exhaustively.  A molecule with no conformers, or one whose conformers never
-    present all the required families, comes back as infinity; the caller sends
-    those to the constrained pass rather than deciding them here.
+    exhaustively.  A molecule with no conformers, or one that does not offer
+    every required family, comes back as infinity; the caller sends those to
+    the constrained pass rather than deciding them here.
     """
+    grouped = _feature_atoms_by_family(bare, feature_factory, query_types)
+    if grouped is None:
+        return float("inf"), True
+
     best = float("inf")
     exhaustive = True
     measured = False
     for conformer in mol.GetConformers():
-        features = feature_factory.GetFeaturesForMol(mol, confId=conformer.GetId())
-        grouped = group_positions_by_family(features)
-        candidates = [grouped.get(family, []) for family in query_types]
-        if any(len(group) == 0 for group in candidates):
-            # This conformer cannot present the required families.
-            continue
+        candidates = [
+            [centroid_in_conformer(conformer, atom_ids) for atom_ids in grouped[family]]
+            for family in query_types
+        ]
         rmsd, complete = best_assignment_rmsd(query_coords, candidates)
         exhaustive = exhaustive and complete
         measured = True
@@ -181,7 +213,7 @@ def prefilter_chunk(
 
             for mol, bare, position in zip(batch, base, batch_positions):
                 best, exhaustive = _best_rmsd_for_mol(
-                    mol, feature_factory, query_types, query_coords
+                    mol, bare, feature_factory, query_types, query_coords
                 )
                 if np.isfinite(best):
                     rmsd_by_position[position] = best

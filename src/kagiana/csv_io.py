@@ -26,7 +26,7 @@ import csv
 import os
 import tempfile
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pandas as pd
 
@@ -191,21 +191,23 @@ def append_frame(
     return target
 
 
-def concat_csv_body(source: str | Path, destination_handle: object, header: bool) -> int:
-    """Copy one CSV into an open handle, keeping at most one header line.
+def concat_csv_records(source: str | Path, writer: Any, write_header: bool) -> int:
+    """Copy one CSV into a writer, keeping at most one header *record*.
 
-    Returns the number of data records copied.  Combining finished per-chunk
-    files this way keeps the peak memory of an aggregation at one chunk instead
-    of the whole run.
+    Combining finished per-chunk files this way keeps the peak memory of an
+    aggregation at one chunk instead of the whole run.  It works in CSV records
+    rather than physical lines, because a column name may itself contain a
+    newline and skipping one line of such a header would write the rest of it
+    out as data.
     """
     copied = 0
-    with open(source, newline="", encoding="utf-8") as reader:
-        for position, line in enumerate(reader):
+    with open(source, newline="", encoding="utf-8") as handle:
+        for position, record in enumerate(csv.reader(handle)):
             if position == 0:
-                if header:
-                    destination_handle.write(line)  # type: ignore[attr-defined]
+                if write_header:
+                    writer.writerow(record)
                 continue
-            destination_handle.write(line)  # type: ignore[attr-defined]
+            writer.writerow(record)
             copied += 1
     return copied
 

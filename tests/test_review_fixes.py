@@ -569,3 +569,260 @@ def test_hits_are_counted_as_records_not_lines(
     assert len(combined) == 1
     assert summary["n_screened"] == len(combined)
     assert combined["note"].iloc[0] == "first\nsecond"
+
+
+# --- third review round ----------------------------------------------------
+
+
+def _write(path: Path, *rows: str) -> Path:
+    path.write_text("\n".join(("ID,SMILES", *rows)) + "\n", encoding="utf-8")
+    return path
+
+
+def test_resume_does_not_mix_results_from_a_different_library(
+    tmp_path: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    """Output files alone cannot say which run produced them.
+
+    Screening a second library into the same place, then resuming, must not
+    keep whichever half of the earlier results happens to still be on disk.
+    """
+    old = _write(tmp_path / "old.csv", "old0,NCCc1ccc(O)cc1", "old1,NCCc1ccc(OC)cc1")
+    new = _write(tmp_path / "new.csv", "new0,c1ccccc1", "new1,C", "new2,CCO")
+    out = tmp_path / "r.csv"
+    base = ["--pharmacophore", str(pharmacophore), "--fdef", str(fdef), "--quiet"]
+
+    assert main(["pharm3d", "--library", str(old), *base, "--out", str(out)]) == EXIT_OK
+    assert list(pd.read_csv(csv_io.screened_path(out), index_col=0)["ID"]) == [
+        "old0", "old1"
+    ]
+
+    # Stand in for an interruption between the two outputs: the full file has
+    # been replaced with the new library's results, the hit list has not.
+    staging = tmp_path / "staged.csv"
+    assert main(["pharm3d", "--library", str(new), *base, "--out", str(staging)]) == EXIT_OK
+    out.write_text(staging.read_text(encoding="utf-8"), encoding="utf-8")
+
+    assert main(
+        ["pharm3d", "--library", str(new), *base, "--out", str(out), "--resume"]
+    ) == EXIT_OK
+    full = pd.read_csv(out, index_col=0)
+    hits = pd.read_csv(csv_io.screened_path(out), index_col=0)
+    assert list(full["ID"]) == ["new0", "new1", "new2"]
+    # Nothing from the earlier library may survive in either file.
+    assert not set(hits["ID"]) & {"old0", "old1"}
+
+
+def test_resume_does_not_keep_a_stale_chunk_from_a_different_library(
+    tmp_path: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    old = _write(tmp_path / "old.csv", "old0,NCCc1ccc(O)cc1", "old1,NCCc1ccc(OC)cc1")
+    new = _write(tmp_path / "new.csv", "new0,c1ccccc1", "new1,C", "new2,CCO")
+    out = tmp_path / "r.csv"
+    base = [
+        "--pharmacophore", str(pharmacophore), "--fdef", str(fdef),
+        "--large", "--chunksize", "1", "--quiet",
+    ]
+
+    assert main(["pharm3d", "--library", str(old), *base, "--out", str(out)]) == EXIT_OK
+    # Stand in for an interruption after the first chunk of the new run: chunk
+    # 0 is the new library's, chunks 1 and 2 are missing or stale.
+    assert main(
+        ["pharm3d", "--library", str(new), *base, "--out", str(out), "--resume"]
+    ) == EXIT_OK
+
+    produced = [
+        pd.read_csv(csv_io.numbered_path(out, index), index_col=0)["ID"].iloc[0]
+        for index in range(3)
+    ]
+    assert produced == ["new0", "new1", "new2"]
+
+
+def test_a_finished_run_publishes_its_diagnostics_when_resumed(
+    tmp_path: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    """Interrupting between the results and the log must not hide the reasons."""
+    library = _write(tmp_path / "lib.csv", "1,not-a-smiles", "2,NCCc1ccc(O)cc1")
+    out = tmp_path / "r.csv"
+    argv = [
+        "pharm3d", "--library", str(library),
+        "--pharmacophore", str(pharmacophore), "--fdef", str(fdef),
+        "--out", str(out), "--quiet",
+    ]
+    assert main(argv) == EXIT_OK
+    log = tmp_path / "r_errors.jsonl"
+    assert log.is_file()
+
+    # Stand in for a crash after both CSVs were replaced but before the log was
+    # published.
+    log.unlink()
+    summary_path = tmp_path / "s.json"
+    assert main([*argv, "--resume", "--json-summary", str(summary_path)]) == EXIT_OK
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["n_parse_error"] == 1
+    assert log.is_file()
+    assert str(log) in summary["outputs"]
+
+
+def test_a_chunk_that_failed_nothing_is_recorded_as_screened(
+    tmp_path: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    """"Screened, nothing wrong" and "never screened" must not look alike.
+
+    Otherwise a resumed run would fall back on an older log and resurrect
+    failures the current results do not have.
+    """
+    broken = _write(tmp_path / "broken.csv", "1,not-a-smiles", "2,NCCc1ccc(O)cc1")
+    clean = _write(tmp_path / "clean.csv", "1,CCO", "2,NCCc1ccc(O)cc1")
+    out = tmp_path / "r.csv"
+    base = [
+        "--pharmacophore", str(pharmacophore), "--fdef", str(fdef),
+        "--large", "--chunksize", "1", "--quiet",
+    ]
+
+    assert main(["pharm3d", "--library", str(broken), *base, "--out", str(out)]) == EXIT_OK
+    assert (tmp_path / "r_errors.jsonl").is_file()
+
+    summary_path = tmp_path / "s.json"
+    assert main(
+        ["pharm3d", "--library", str(clean), *base, "--out", str(out),
+         "--json-summary", str(summary_path)]
+    ) == EXIT_OK
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert summary["n_parse_error"] == 0
+    assert not (tmp_path / "r_errors.jsonl").exists()
+
+
+def test_many_chunks_with_diagnostics_do_not_exhaust_file_descriptors(
+    tmp_path: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    """One chunk's diagnostics are open at a time, whatever the chunk count."""
+    import resource
+
+    rows = [f"{i},not-a-smiles-{i}" for i in range(80)]
+    library = _write(tmp_path / "lib.csv", *rows)
+    out = tmp_path / "r.csv"
+
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (min(256, hard), hard))
+    try:
+        assert main(
+            ["pharm3d", "--library", str(library),
+             "--pharmacophore", str(pharmacophore), "--fdef", str(fdef),
+             "--out", str(out), "--large", "--chunksize", "1", "--jobs", "1",
+             "--quiet"]
+        ) == EXIT_OK
+    finally:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    from kagiana.errlog import read_entries
+
+    assert len(read_entries(tmp_path / "r_errors.jsonl")) == 80
+
+
+def test_progress_reported_after_the_deadline_is_not_counted(
+    fdef: Path, pharmacophore: Path
+) -> None:
+    """A timed-out row reports the work done inside the deadline, no more.
+
+    The worker keeps generating poses until it is killed, and the parent may
+    read its reports much later; neither may inflate the count.
+    """
+    import time
+
+    from kagiana.backends.cpu3d import init_worker
+    from kagiana.pool import KillableWorkerPool
+
+    counts = []
+    for stall in (0.0, 0.3):
+        with KillableWorkerPool(
+            1, init_worker, (str(fdef), str(pharmacophore), 1.5, 0.5, 200, 20),
+            timeout=0.01,
+        ) as pool:
+            for result in pool.map_ordered(["NCCc1ccc(O)cc1"]):
+                if stall:
+                    time.sleep(stall)
+                assert result.status == Status.TIMEOUT
+                counts.append(result.partial.num_match() if result.partial else 0)
+
+    # A slow reader must not change what the row says.
+    assert counts[0] == counts[1]
+
+
+def test_the_fit_uses_the_features_a_cpu_run_would_see(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit hydrogens are needed to embed, but not to identify features.
+
+    Measuring the fit on features found after adding them can reject a molecule
+    the constrained pass would score.
+    """
+    import numpy as np
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+
+    from kagiana.backends import gpu3d
+    from kagiana.backends.cpu3d import screen_molecule
+    from kagiana.features import load_feature_factory
+    from kagiana.pharmacophore3d import make_pharmacophore
+
+    fdef = tmp_path / "tips.fdef"
+    fdef.write_text(
+        "DefineFeature TerminalOrOxyCarbon [#6;D1,$([#6]-[#8])]\n"
+        "  Family CarbonTip\n  Weights 1\nEndFeature\n\n"
+        "DefineFeature AnyNitrogen [#7]\n  Family Nitro\n  Weights 1\nEndFeature\n",
+        encoding="utf-8",
+    )
+    query = tmp_path / "q.csv"
+    query.write_text(
+        "feature_type,X,Y,Z\nCarbonTip,0,0,0\nNitro,2.5,0,0\n", encoding="utf-8"
+    )
+
+    smiles = "CC(N)c1ccc(CO)cc1"
+    cpu = screen_molecule(
+        smiles, load_feature_factory(fdef), make_pharmacophore(query, 1.5, 0.5), 10, 200
+    )
+    assert cpu is not None and cpu.num_match > 0
+
+    bare = Chem.MolFromSmiles(smiles)
+    mol = Chem.AddHs(bare)
+    AllChem.EmbedMultipleConfs(mol, numConfs=20, randomSeed=42)
+    best, exhaustive = gpu3d._best_rmsd_for_mol(
+        mol,
+        bare,
+        load_feature_factory(fdef),
+        ["CarbonTip", "Nitro"],
+        np.array([[0.0, 0.0, 0.0], [2.5, 0.0, 0.0]]),
+    )
+    assert exhaustive is True
+    # The default threshold is 1.5; a fit measured on the wrong representation
+    # came out at 1.879 and the molecule was discarded.
+    assert best < 1.5
+
+
+def test_a_column_name_containing_a_newline_survives_aggregation(
+    tmp_path: Path, fdef: Path, pharmacophore: Path
+) -> None:
+    """Skipping one physical line of a header would write the rest out as data."""
+    import csv as csv_module
+
+    library = tmp_path / "lib.csv"
+    with open(library, "w", newline="", encoding="utf-8") as handle:
+        writer = csv_module.writer(handle)
+        writer.writerow(["ID", "SMILES", "vendor\nnote"])
+        writer.writerow(["1", "NCCc1ccc(O)cc1", "a"])
+        writer.writerow(["2", "NCCc1ccc(OC)cc1", "b"])
+
+    out = tmp_path / "r.csv"
+    summary_path = tmp_path / "s.json"
+    assert main(
+        ["pharm3d", "--library", str(library), "--pharmacophore", str(pharmacophore),
+         "--fdef", str(fdef), "--out", str(out), "--large", "--chunksize", "1",
+         "--quiet", "--json-summary", str(summary_path)]
+    ) == EXIT_OK
+
+    with open(csv_io.screened_all_path(out), newline="", encoding="utf-8") as handle:
+        records = list(csv_module.reader(handle))
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    assert len(records) - 1 == summary["n_screened"] == 2
+    assert "vendor\nnote" in records[0]

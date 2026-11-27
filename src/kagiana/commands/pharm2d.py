@@ -20,6 +20,7 @@ from ..errlog import ErrorLog
 from ..backends import CPU, GPU, resolve_backend
 from ..backends.cpu2d import init_worker as cpu_init_worker
 from ..pool import KillableWorkerPool, default_jobs
+from ..runstate import RunState, generation_key
 from ..progress import note, progress_bar
 from ..query2d import (
     build_sig_factory,
@@ -86,11 +87,29 @@ def run(args: argparse.Namespace) -> RunSummary:
 
     screened_frames: list[pd.DataFrame] = []
     wrote_all_rows_header = False
-    error_log = ErrorLog(args.out)
+    state = RunState.open(
+        args.out,
+        generation_key(
+            mode="pharm2d",
+            library=Path(args.library),
+            query=Path(args.query),
+            fdef=Path(args.fdef),
+            params=Path(args.params),
+            chunksize=params.chunksize,
+            cutoffs=(
+                params.tanimoto_cutoff,
+                params.dice_cutoff,
+                params.simpson_cutoff,
+            ),
+        ),
+        resume=args.resume,
+    )
+    error_log = ErrorLog(args.out, state)
 
     for chunk_index, frame in csv_io.read_chunks(args.library, params.chunksize):
         summary.n_chunks += 1
         smiles = csv_io.smiles_values(frame, SMILES_COLUMN)
+        error_log.start_chunk(chunk_index)
 
         if backend == GPU:
             from ..backends import gpu2d
@@ -137,6 +156,8 @@ def run(args: argparse.Namespace) -> RunSummary:
             )
             wrote_all_rows_header = True
 
+        error_log.finish_chunk()
+        state.mark_chunk_complete(chunk_index)
         screened_frames.append(_apply_cutoffs(scored, params))
 
     screened = (
@@ -144,13 +165,13 @@ def run(args: argparse.Namespace) -> RunSummary:
         if screened_frames
         else pd.DataFrame()
     )
-    error_log.close()
     summary.n_screened = len(screened)
     csv_io.write_frame(screened, args.out, index=False)
     summary.outputs.append(str(args.out))
     if write_all_rows and wrote_all_rows_header:
         summary.outputs.append(str(all_rows_target))
-    if error_log.used:
+    state.mark_finalized()
+    if error_log.publish():
         summary.outputs.append(str(error_log.path))
         summary.notes.append(
             f"{error_log.count} row(s) did not score cleanly; see {error_log.path}"

@@ -39,7 +39,7 @@ _BUSY = "busy"
 
 # Set inside a worker process while a task is running, so that a task can
 # report partial progress the parent can still use if the worker is killed.
-_CURRENT: dict[str, Any] = {"conn": None, "index": -1}
+_CURRENT: dict[str, Any] = {"conn": None, "index": -1, "started": 0.0}
 
 
 def report_progress(value: Any) -> None:
@@ -54,7 +54,11 @@ def report_progress(value: Any) -> None:
     if conn is None:
         return
     try:
-        conn.send(("progress", (_CURRENT["index"], value)))
+        # The worker's own elapsed time travels with the report. The parent
+        # cannot infer it: by the time a report is read, the deadline may have
+        # passed for reasons that have nothing to do with the work.
+        elapsed = monotonic() - float(_CURRENT["started"])
+        conn.send(("progress", (_CURRENT["index"], elapsed, value)))
     except (OSError, BrokenPipeError, ValueError):
         pass
 
@@ -111,9 +115,10 @@ def _worker_loop(
         if message is None:
             return
         index, payload = message
+        started = monotonic()
         _CURRENT["conn"] = conn
         _CURRENT["index"] = index
-        started = monotonic()
+        _CURRENT["started"] = started
         try:
             try:
                 value = task(payload)
@@ -373,8 +378,11 @@ class KillableWorkerPool:
             slot.state = _IDLE
             return None
         if kind == "progress":
-            progress_index, value = payload
-            if progress_index == slot.index:
+            progress_index, elapsed, value = payload
+            # Progress the worker reported after its deadline is work the
+            # caller said it did not want, so it must not reach the result.
+            within_deadline = self._timeout is None or elapsed <= self._timeout
+            if progress_index == slot.index and within_deadline:
                 slot.progress = value
             return None
 
